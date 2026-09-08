@@ -1,0 +1,30 @@
+{
+  "name": "crm-firestore-backend",
+  "private": true,
+  "workspaces": [
+    "functions"
+  ],
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "firebase-admin": "^13.5.0",
+    "xlsx": "^0.18.5"
+  },
+  "scripts": {
+    "build": "npm --workspace functions run build",
+    "lint": "npm --workspace functions run lint",
+    "firebase": "npx firebase-tools@latest",
+    "deploy:functions": "npx firebase-tools@latest deploy --only functions",
+    "deploy": "npm --workspace functions run deploy",
+    "emulators": "npm --workspace functions run emulators",
+    "migrate": "node scripts/migrate-sheets-to-firestore.mjs",
+    "migrate:users": "node scripts/migrate-users-to-firestore.mjs",
+    "hash:passwords": "node scripts/hash-passwords.mjs",
+    "export:eod": "node scripts/eod-export-to-sheets.mjs",
+    "export:logs": "node scripts/export-logs-to-sheets.mjs",
+    "sync:sheet-to-firestore": "node scripts/sync-sheet-to-firestore.mjs",
+    "sync:consultation-visited": "node scripts/sync-consultation-visited.mjs",
+    "sync:order-match": "node scripts/sync-order-match.mjs",
+    "verify:parity": "node scripts/verify-parity.mjs",
+    "perf:update": "node scripts/perf-update-lead.mjs"
+  }
+}
