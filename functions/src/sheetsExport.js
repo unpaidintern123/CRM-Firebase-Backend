@@ -1,7 +1,8 @@
 import { google } from "googleapis";
 import { getLeads } from "./leadService.js";
 import { getFirestore } from "./firebase.js";
-import { firestoreDateToDisplayString } from "./sheetDateUtils.js";
+import { toSheetsSerialDate } from "./sheetDateUtils.js";
+import { LEAD_FIELD_MAP } from "./mapper.js";
 
 function getGoogleAuth() {
   const privateKey = (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
@@ -12,8 +13,98 @@ function getGoogleAuth() {
   });
 }
 
+/**
+ * Write dates as Sheets serial numbers (not text).
+ * Column numberFormat still shows dd/MM/yyyy HH:mm:ss; formula bar has no leading apostrophe.
+ */
 function cellDate(value) {
-  return firestoreDateToDisplayString(value) || "";
+  return toSheetsSerialDate(value);
+}
+
+/**
+ * Phone as a real number cell (strips non-digits; drops leading 91 when 12 digits).
+ * Empty / unparseable → "".
+ */
+function cellPhone(value) {
+  if (value === null || value === undefined || value === "") return "";
+  let digits = String(value).replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.length === 12 && digits.startsWith("91")) digits = digits.slice(2);
+  if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
+  const n = Number(digits);
+  return Number.isFinite(n) ? n : "";
+}
+
+/** Numeric sheet cell; empty / non-numeric → "". */
+function cellNumber(value) {
+  if (value === null || value === undefined || value === "") return "";
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const cleaned = String(value).replace(/,/g, "").trim();
+  if (!cleaned) return "";
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : "";
+}
+
+/** Flatten multiline text so Sheets append/table detection cannot split a log across rows. */
+function cellText(value) {
+  if (value === null || value === undefined) return "";
+  return String(value)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const FIELD_TO_HEADER = Object.fromEntries(
+  Object.entries(LEAD_FIELD_MAP).map(([header, field]) => [field, header])
+);
+
+const SHEET_DATE_FIELDS = new Set([
+  "leadDate",
+  "followUpDate",
+  "consutlationBookedDate",
+  "consutlationVisitedDate",
+  "orderDate",
+  "firstContactTimestamp",
+]);
+
+const SHEET_PHONE_FIELDS = new Set(["mobileNo", "secondaryMobileNo"]);
+
+const SHEET_NUMBER_FIELDS = new Set([
+  "noOfFollowups",
+  "totalSalesAmount",
+  "leadScore",
+]);
+
+/** Never patch these from CRM update → sheet (identity / server meta). */
+const SHEET_PATCH_SKIP_FIELDS = new Set([
+  "leadUniqueId",
+  "leadDate",
+  "actor",
+  "idempotencyKey",
+  "updatedAt",
+  "crmUpdatedAt",
+  "createdAt",
+  "lastIdempotencyKey",
+  "sheetRowNumber",
+  "sheetSyncedAt",
+  "sourceLastSyncedAt",
+  "lastInboundSyncAt",
+  "lastInboundSyncBy",
+  "syncSource",
+  "syncStatus",
+  "assignmentStatus",
+  "assignmentSource",
+  "assignedAt",
+]);
+
+function formatSheetCellValue(field, value) {
+  if (SHEET_DATE_FIELDS.has(field)) return cellDate(value);
+  if (SHEET_PHONE_FIELDS.has(field)) return cellPhone(value);
+  if (SHEET_NUMBER_FIELDS.has(field)) return cellNumber(value);
+  if (value === undefined || value === null) return "";
+  return value;
 }
 
 function toRow(lead) {
@@ -21,7 +112,7 @@ function toRow(lead) {
     cellDate(lead.leadDate),
     lead.leadUniqueId || "",
     lead.clientName || "",
-    lead.mobileNo || "",
+    cellPhone(lead.mobileNo),
     lead.city || "",
     lead.town || "",
     lead.callType || "",
@@ -31,7 +122,7 @@ function toRow(lead) {
     lead.assignedTo || "",
     lead.interestedIn || "",
     cellDate(lead.followUpDate),
-    lead.noOfFollowups || "",
+    cellNumber(lead.noOfFollowups),
     cellDate(lead.consutlationBookedDate),
     cellDate(lead.consutlationVisitedDate),
     lead.consultationType || "",
@@ -40,9 +131,9 @@ function toRow(lead) {
     lead.Q1 || "",
     lead.Q2 || "",
     lead.Q3 || "",
-    "",
-    "",
-    "",
+    lead.hairFallSince || "",
+    lead.doneHairTransplantBefore || "",
+    lead.gottenHairSystemBefore || "",
     lead.hearAboutUs || "",
     lead.campaignname || "",
     lead.adsetname || "",
@@ -50,15 +141,17 @@ function toRow(lead) {
     lead.campaignsource || "",
     lead.placement || "",
     lead.orderStatus || "",
-    lead.totalSalesAmount || "",
-    "",
-    "",
+    cellNumber(lead.totalSalesAmount),
+    cellNumber(lead.leadScore),
+    lead.leadQualification || "",
     lead.consultationStatus || "",
     lead.notBookedFeedback || "",
     cellDate(lead.orderDate),
-    "",
-    lead.preferredTimeToCall || "",
     lead.consultationMode || "",
+    cellPhone(lead.secondaryMobileNo),
+    lead.preferredTimeToCall || "",
+    cellDate(lead.firstContactTimestamp),
+    lead.leadLabel || "",
   ];
 }
 
@@ -66,20 +159,20 @@ function followUpLogToRow(log, lead) {
   return [
     cellDate(log.createdAt),
     cellDate(lead?.leadDate),
-    log.leadUniqueId || "",
-    lead?.clientName || "",
-    lead?.mobileNo || "",
-    lead?.city || "",
-    lead?.town || "",
-    lead?.callType || "",
-    lead?.platform || "",
-    log.leadStatus || lead?.leadStatus || "",
-    lead?.rating || "",
-    lead?.assignedTo || "",
-    lead?.interestedIn || "",
+    cellText(log.leadUniqueId),
+    cellText(lead?.clientName),
+    cellPhone(lead?.mobileNo),
+    cellText(lead?.city),
+    cellText(lead?.town),
+    cellText(lead?.callType),
+    cellText(lead?.platform),
+    cellText(log.leadStatus || lead?.leadStatus),
+    cellText(lead?.rating),
+    cellText(lead?.assignedTo),
+    cellText(lead?.interestedIn),
     cellDate(log.followUpDate),
-    lead?.initialRemark || "",
-    log.remark || lead?.detailComment || "",
+    cellText(lead?.initialRemark),
+    cellText(log.remark || lead?.detailComment),
   ];
 }
 
@@ -87,26 +180,26 @@ function consultationLogToRow(log, lead) {
   return [
     cellDate(log.createdAt),
     cellDate(lead?.leadDate),
-    log.leadUniqueId || "",
-    lead?.clientName || "",
-    lead?.mobileNo || "",
-    lead?.city || "",
-    lead?.town || "",
-    lead?.callType || "",
-    lead?.platform || "",
-    lead?.leadStatus || "",
-    lead?.rating || "",
-    lead?.assignedTo || "",
-    lead?.interestedIn || "",
+    cellText(log.leadUniqueId),
+    cellText(lead?.clientName),
+    cellPhone(lead?.mobileNo),
+    cellText(lead?.city),
+    cellText(lead?.town),
+    cellText(lead?.callType),
+    cellText(lead?.platform),
+    cellText(lead?.leadStatus),
+    cellText(lead?.rating),
+    cellText(lead?.assignedTo),
+    cellText(lead?.interestedIn),
     cellDate(log.consultationBookedDate),
-    lead?.initialRemark || "",
-    lead?.detailComment || "",
-    log.consultationType || lead?.consultationType || "",
-    lead?.campaignname || "",
-    lead?.adsetname || "",
-    lead?.adname || "",
-    lead?.campaignsource || "",
-    lead?.placement || "",
+    cellText(lead?.initialRemark),
+    cellText(lead?.detailComment),
+    cellText(log.consultationType || lead?.consultationType),
+    cellText(lead?.campaignname),
+    cellText(lead?.adsetname),
+    cellText(lead?.adname),
+    cellText(lead?.campaignsource),
+    cellText(lead?.placement),
   ];
 }
 
@@ -118,20 +211,89 @@ async function loadLeadsByIds(db, ids) {
   return new Map(snaps.filter((s) => s.exists).map((s) => [s.id, s.data()]));
 }
 
+async function getSheetMetaByTitle(sheets, spreadsheetId, sheetName) {
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))",
+  });
+  const match = (meta.data.sheets || []).find(
+    (s) => String(s.properties?.title || "") === String(sheetName)
+  );
+  if (!match?.properties) {
+    throw new Error(`Sheet tab not found: ${sheetName}`);
+  }
+  return match.properties;
+}
+
+/**
+ * Write rows starting at column A of the next free row.
+ * Avoids spreadsheets.values.append table-detection, which can shift new rows
+ * (e.g. start at column H) when a prior log left empty leading cells / sparse rows.
+ * Expands the sheet grid when full (Apps Script appendRow does this automatically).
+ */
 async function appendRows(sheets, spreadsheetId, range, rows) {
   if (!rows.length) return;
-  await sheets.spreadsheets.values.append({
+
+  const bang = String(range).lastIndexOf("!");
+  const sheetName = bang >= 0 ? String(range).slice(0, bang) : String(range);
+  const a1 = bang >= 0 ? String(range).slice(bang + 1) : "A:A";
+  const endColMatch = a1.match(/:([A-Za-z]+)\d*$/);
+  const endCol = endColMatch ? endColMatch[1].toUpperCase() : "A";
+
+  const colAResp = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range,
+    range: `${sheetName}!A:A`,
+    majorDimension: "ROWS",
+  });
+  const colA = colAResp.data.values || [];
+  let lastRowWithA = 0;
+  for (let i = colA.length - 1; i >= 0; i -= 1) {
+    if (String(colA[i]?.[0] ?? "").trim() !== "") {
+      lastRowWithA = i + 1;
+      break;
+    }
+  }
+  // Keep header on row 1; never write over it.
+  const startRow = Math.max(lastRowWithA + 1, 2);
+  const endRow = startRow + rows.length - 1;
+  const writeRange = `${sheetName}!A${startRow}:${endCol}${endRow}`;
+
+  const props = await getSheetMetaByTitle(sheets, spreadsheetId, sheetName);
+  const rowCount = Number(props.gridProperties?.rowCount || 0);
+  const neededExtraRows = endRow - rowCount;
+  if (neededExtraRows > 0) {
+    // Grow in chunks so repeated uploads don't fail at the exact grid edge.
+    const growBy = Math.max(neededExtraRows, 500);
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [
+          {
+            appendDimension: {
+              sheetId: props.sheetId,
+              dimension: "ROWS",
+              length: growBy,
+            },
+          },
+        ],
+      },
+    });
+  }
+
+  // USER_ENTERED so date strings (dd/MM/yyyy HH:mm:ss) become real date cells
+  // (RAW stored them as text and Sheets showed a leading apostrophe in the formula bar).
+  // Same option used by Leads Data / full-rebuild writers.
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: writeRange,
     valueInputOption: "USER_ENTERED",
-    insertDataOption: "INSERT_ROWS",
     requestBody: { values: rows },
   });
 }
 
 async function runLogsExportFullRebuild({ dryRun = false } = {}) {
   const startedAt = new Date().toISOString();
-  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1awaq6gNQspr-sjp-yuaH-Nu5JJmhyplVRevoaj47JZw";
+  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
   const followUpSheetName = process.env.CRM_FOLLOWUP_LOGS_SHEET_NAME || "Follow-up Logs";
   const consultationSheetName = process.env.CRM_CONSULTATION_LOGS_SHEET_NAME || "Consultation Booked Logs";
   const db = getFirestore();
@@ -221,7 +383,7 @@ export async function runEndOfDaySync({ dryRun = false } = {}) {
   const leads = await getLeads({ limit: 10000 });
   const rows = leads.map(toRow);
   const sheetName = process.env.CRM_LEADS_SHEET_NAME || "Leads Data";
-  const clearedRange = `${sheetName}!A2:AO`;
+  const clearedRange = `${sheetName}!A2:AQ`;
   const updatedRange = `${sheetName}!A2`;
 
   if (dryRun) {
@@ -239,7 +401,7 @@ export async function runEndOfDaySync({ dryRun = false } = {}) {
 
   const auth = getGoogleAuth();
   const sheets = google.sheets({ version: "v4", auth });
-  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1awaq6gNQspr-sjp-yuaH-Nu5JJmhyplVRevoaj47JZw";
+  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
 
   await sheets.spreadsheets.values.clear({
     spreadsheetId,
@@ -274,7 +436,7 @@ export async function runLogsExportSync({ dryRun = false, fullRebuild = false, b
     return runLogsExportFullRebuild({ dryRun });
   }
   const startedAt = new Date().toISOString();
-  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1awaq6gNQspr-sjp-yuaH-Nu5JJmhyplVRevoaj47JZw";
+  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
   const followUpSheetName = process.env.CRM_FOLLOWUP_LOGS_SHEET_NAME || "Follow-up Logs";
   const consultationSheetName = process.env.CRM_CONSULTATION_LOGS_SHEET_NAME || "Consultation Booked Logs";
   const db = getFirestore();
@@ -378,65 +540,270 @@ export async function runLogsExportSync({ dryRun = false, fullRebuild = false, b
 }
 
 
-export async function updateSingleLeadRowInSheets(lead) {
-  if (!lead || (!lead.leadUniqueId && !lead.mobileNo)) return { success: false, reason: "NO_LEAD_ID" };
-  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1awaq6gNQspr-sjp-yuaH-Nu5JJmhyplVRevoaj47JZw";
-  if (!spreadsheetId) return { success: false, reason: "NO_SPREADSHEET_ID" };
+function mergeLeadRowValues(existingValues = [], lead) {
+  const newRowValues = toRow(lead);
+  const mergedValues = [];
+  const totalCols = Math.max(newRowValues.length, existingValues.length, 43);
+  for (let i = 0; i < totalCols; i++) {
+    const newVal = newRowValues[i];
+    const existingVal = existingValues[i];
+    if (newVal !== undefined && newVal !== null && String(newVal).trim() !== "") {
+      mergedValues[i] = newVal;
+    } else if (existingVal !== undefined && existingVal !== null && String(existingVal).trim() !== "") {
+      mergedValues[i] = existingVal;
+    } else {
+      mergedValues[i] = "";
+    }
+  }
+  return mergedValues;
+}
 
-  const auth = getGoogleAuth();
-  const sheets = google.sheets({ version: "v4", auth });
-  const sheetName = process.env.CRM_LEADS_SHEET_NAME || "Leads Data";
+const leadRowCacheMap = new Map();
 
-  // Fetch Columns B:D (Column B: leadUniqueId, Column D: mobileNo)
+function normalizeLeadId(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead) {
+  const cleanTargetId = normalizeLeadId(lead?.leadUniqueId);
+  const targetMobile = String(lead?.mobileNo || "").replace(/\D/g, "").slice(-10);
+
+  const candidateRows = [];
+  if (typeof lead?.sheetRowNumber === "number" && lead.sheetRowNumber > 1) {
+    candidateRows.push(lead.sheetRowNumber);
+  }
+  if (cleanTargetId && leadRowCacheMap.has(cleanTargetId)) {
+    candidateRows.push(leadRowCacheMap.get(cleanTargetId));
+  }
+
+  // Verify cached/stale sheetRowNumber still points at THIS lead before using it.
+  for (const candidate of candidateRows) {
+    try {
+      const probe = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: `${sheetName}!B${candidate}:D${candidate}`,
+      });
+      const row = (probe.data.values && probe.data.values[0]) || [];
+      const cleanIdVal = normalizeLeadId(row[0]);
+      const mobileVal = String(row[2] || "").replace(/\D/g, "").slice(-10);
+      if (cleanTargetId && cleanIdVal === cleanTargetId) {
+        return candidate;
+      }
+      if (
+        targetMobile &&
+        mobileVal &&
+        mobileVal === targetMobile &&
+        (!cleanIdVal || cleanIdVal === cleanTargetId)
+      ) {
+        return candidate;
+      }
+    } catch (_) {
+      // Fall through to full scan.
+    }
+  }
+
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range: `${sheetName}!B:D`,
   });
-
   const rows = resp.data.values || [];
-  const targetId = String(lead.leadUniqueId || "").trim().toLowerCase();
-  const targetMobile = String(lead.mobileNo || "").replace(/\D/g, "").slice(-10);
-  let foundRow = -1;
-
-  for (let i = 0; i < rows.length; i++) {
+  for (let i = 1; i < rows.length; i++) {
     const idVal = String(rows[i]?.[0] || "").trim().toLowerCase();
+    const cleanIdVal = normalizeLeadId(idVal);
     const mobileVal = String(rows[i]?.[2] || "").replace(/\D/g, "").slice(-10);
 
-    if (targetId && idVal === targetId) {
-      foundRow = i + 1;
-      break;
+    if (cleanTargetId && cleanIdVal === cleanTargetId) {
+      return i + 1;
     }
-    if (targetMobile && mobileVal && mobileVal === targetMobile) {
-      foundRow = i + 1;
-      break;
+    if (
+      targetMobile &&
+      mobileVal &&
+      mobileVal === targetMobile &&
+      (!cleanIdVal || cleanIdVal === cleanTargetId)
+    ) {
+      return i + 1;
     }
   }
 
-  const rowValues = toRow(lead);
+  return null;
+}
 
-  if (foundRow > 0) {
+export async function updateSingleLeadRowInSheets(lead, options = {}) {
+  if (!lead || (!lead.leadUniqueId && !lead.mobileNo)) return { success: false, reason: "NO_LEAD_ID" };
+  const { allowAppend = false, changedFields = null } = options;
+
+  // Fast path: only rewrite columns that were actually updated.
+  if (Array.isArray(changedFields) && changedFields.length) {
+    return patchLeadFieldsInSheets(lead, changedFields);
+  }
+
+  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
+  if (!spreadsheetId) return { success: false, reason: "NO_SPREADSHEET_ID" };
+
+  const auth = getGoogleAuth();
+  const sheets = google.sheets({ version: "v4", auth });
+  const sheetName = process.env.CRM_LEADS_SHEET_NAME || "Leads Data";
+  const cleanTargetId = normalizeLeadId(lead.leadUniqueId);
+
+  const foundRow = await findLeadRowNumber(sheets, spreadsheetId, sheetName, lead);
+  const newRowValues = toRow(lead);
+
+  if (foundRow && foundRow > 1) {
+    if (cleanTargetId) leadRowCacheMap.set(cleanTargetId, foundRow);
+
+    // Legacy full-row path: merge blanks with existing so we never wipe untouched columns.
+    let existingValues = [];
+    try {
+      const existingResp = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: `${sheetName}!A${foundRow}:AQ${foundRow}`,
+      });
+      existingValues = (existingResp.data.values && existingResp.data.values[0]) || [];
+    } catch (_) {
+      existingValues = [];
+    }
+
+    const totalCols = Math.max(newRowValues.length, existingValues.length, 43);
+    const mergedValues = [];
+    for (let i = 0; i < totalCols; i++) {
+      const newVal = newRowValues[i];
+      const existingVal = existingValues[i];
+      if (newVal !== undefined && newVal !== null && String(newVal).trim() !== "") {
+        mergedValues[i] = newVal;
+      } else if (existingVal !== undefined && existingVal !== null && String(existingVal).trim() !== "") {
+        mergedValues[i] = existingVal;
+      } else {
+        mergedValues[i] = newVal === undefined || newVal === null ? "" : newVal;
+      }
+    }
+
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: `${sheetName}!A${foundRow}:AO${foundRow}`,
+      range: `${sheetName}!A${foundRow}:AQ${foundRow}`,
       valueInputOption: "USER_ENTERED",
-      requestBody: { values: [rowValues] },
+      requestBody: { values: [mergedValues] },
     });
     return { success: true, mode: "updated", row: foundRow };
-  } else {
+  } else if (allowAppend) {
     await sheets.spreadsheets.values.append({
       spreadsheetId,
-      range: `${sheetName}!A:AO`,
+      range: `${sheetName}!A:AQ`,
       valueInputOption: "USER_ENTERED",
       insertDataOption: "INSERT_ROWS",
-      requestBody: { values: [rowValues] },
+      requestBody: { values: [newRowValues] },
     });
     return { success: true, mode: "appended" };
+  } else {
+    console.warn(`Lead ${lead.leadUniqueId} not found in sheet for update; skipping append to prevent duplicate rows.`);
+    return { success: false, reason: "LEAD_ROW_NOT_FOUND" };
   }
 }
 
-export async function updateMultipleLeadRowsInSheets(leads) {
+/**
+ * Patch only the given camelCase lead fields onto the matching Leads Data row.
+ * Other columns are left untouched. Never appends a new row.
+ */
+export async function patchLeadFieldsInSheets(lead, changedFields = []) {
+  if (!lead || !lead.leadUniqueId) return { success: false, reason: "NO_LEAD_ID" };
+  const fields = [...new Set((changedFields || []).filter(Boolean))].filter(
+    (f) => !SHEET_PATCH_SKIP_FIELDS.has(f) && FIELD_TO_HEADER[f]
+  );
+  if (!fields.length) return { success: true, mode: "noop", updatedCells: 0 };
+
+  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
+  if (!spreadsheetId) return { success: false, reason: "NO_SPREADSHEET_ID" };
+
+  const auth = getGoogleAuth();
+  const sheets = google.sheets({ version: "v4", auth });
+  const sheetName = process.env.CRM_LEADS_SHEET_NAME || "Leads Data";
+  const cleanTargetId = normalizeLeadId(lead.leadUniqueId);
+
+  const headerResp = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${sheetName}!1:1`,
+  });
+  const headers = (headerResp.data.values && headerResp.data.values[0]) || [];
+  const headerIndex = new Map();
+  headers.forEach((h, idx) => {
+    const key = String(h || "").trim().toLowerCase();
+    if (key && !headerIndex.has(key)) headerIndex.set(key, idx);
+  });
+
+  const foundRow = await findLeadRowNumber(sheets, spreadsheetId, sheetName, lead);
+  if (!foundRow || foundRow < 2) {
+    console.warn(
+      `Lead ${lead.leadUniqueId} not found in sheet for partial patch; skipping to prevent duplicate rows.`
+    );
+    return { success: false, reason: "LEAD_ROW_NOT_FOUND" };
+  }
+  if (cleanTargetId) leadRowCacheMap.set(cleanTargetId, foundRow);
+
+  const data = [];
+  const missingHeaders = [];
+  for (const field of fields) {
+    const headerName = FIELD_TO_HEADER[field];
+    const colIdx = headerIndex.get(String(headerName).toLowerCase());
+    if (colIdx === undefined) {
+      missingHeaders.push(headerName);
+      continue;
+    }
+    const colLetter = columnIndexToA1(colIdx);
+    data.push({
+      range: `${sheetName}!${colLetter}${foundRow}`,
+      values: [[formatSheetCellValue(field, lead[field])]],
+    });
+  }
+
+  if (!data.length) {
+    return {
+      success: false,
+      reason: "NO_MAPPED_COLUMNS",
+      missingHeaders,
+    };
+  }
+
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      valueInputOption: "USER_ENTERED",
+      data,
+    },
+  });
+
+  return {
+    success: true,
+    mode: "partial_patch",
+    row: foundRow,
+    updatedCells: data.length,
+    missingHeaders,
+  };
+}
+
+/**
+ * Update only the "Lead Label" cell for an existing lead. Never appends a new row.
+ */
+export async function updateLeadLabelInSheets(lead) {
+  return patchLeadFieldsInSheets(lead, ["leadLabel"]);
+}
+
+function columnIndexToA1(index) {
+  let n = index + 1;
+  let s = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+export async function updateMultipleLeadRowsInSheets(leads, options = {}) {
   if (!Array.isArray(leads) || !leads.length) return { success: true, updatedCount: 0 };
-  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1awaq6gNQspr-sjp-yuaH-Nu5JJmhyplVRevoaj47JZw";
+  const { allowAppend = false } = options;
+  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
   if (!spreadsheetId) return { success: false, reason: "NO_SPREADSHEET_ID" };
 
   const auth = getGoogleAuth();
@@ -445,32 +812,67 @@ export async function updateMultipleLeadRowsInSheets(leads) {
 
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `${sheetName}!B:B`,
+    range: `${sheetName}!A:AQ`,
   });
 
-  const colValues = resp.data.values || [];
+  const allRows = resp.data.values || [];
   const idToRowMap = new Map();
-  for (let i = 0; i < colValues.length; i++) {
-    const val = String(colValues[i]?.[0] || "").trim();
-    if (val) idToRowMap.set(val, i + 1);
+  const idToExistingValuesMap = new Map();
+
+  for (let i = 1; i < allRows.length; i++) {
+    const val = String(allRows[i]?.[1] || "").trim().toLowerCase();
+    const cleanVal = val.replace(/[^a-z0-9]/g, "");
+    if (val) {
+      idToRowMap.set(val, i + 1);
+      idToExistingValuesMap.set(val, allRows[i]);
+    }
+    if (cleanVal) {
+      idToRowMap.set(cleanVal, i + 1);
+      idToExistingValuesMap.set(cleanVal, allRows[i]);
+    }
   }
 
   const updateData = [];
   const appendData = [];
+  let skippedMissing = 0;
 
   for (const lead of leads) {
     if (!lead || !lead.leadUniqueId) continue;
-    const targetId = String(lead.leadUniqueId).trim();
-    const rowValues = toRow(lead);
-    const foundRow = idToRowMap.get(targetId);
+    const targetId = String(lead.leadUniqueId).trim().toLowerCase();
+    const cleanTargetId = targetId.replace(/[^a-z0-9]/g, "");
+    const newRowValues = toRow(lead);
+    const existingValues =
+      idToExistingValuesMap.get(targetId) ||
+      idToExistingValuesMap.get(cleanTargetId) ||
+      [];
+    const foundRow = idToRowMap.get(targetId) || idToRowMap.get(cleanTargetId);
+
+    const mergedValues = [];
+    const totalCols = Math.max(newRowValues.length, existingValues.length, 43);
+    for (let i = 0; i < totalCols; i++) {
+      const newVal = newRowValues[i];
+      const existingVal = existingValues[i];
+      if (newVal !== undefined && newVal !== null && String(newVal).trim() !== "") {
+        mergedValues[i] = newVal;
+      } else if (existingVal !== undefined && existingVal !== null && String(existingVal).trim() !== "") {
+        mergedValues[i] = existingVal;
+      } else {
+        mergedValues[i] = "";
+      }
+    }
 
     if (foundRow) {
       updateData.push({
-        range: `${sheetName}!A${foundRow}:AO${foundRow}`,
-        values: [rowValues],
+        range: `${sheetName}!A${foundRow}:AQ${foundRow}`,
+        values: [mergedValues],
       });
+    } else if (allowAppend) {
+      appendData.push(mergedValues);
     } else {
-      appendData.push(rowValues);
+      skippedMissing += 1;
+      console.warn(
+        `Lead ${lead.leadUniqueId} not found in sheet for batch update; skipping append to prevent duplicate rows.`
+      );
     }
   }
 
@@ -487,19 +889,24 @@ export async function updateMultipleLeadRowsInSheets(leads) {
   if (appendData.length) {
     await sheets.spreadsheets.values.append({
       spreadsheetId,
-      range: `${sheetName}!A:AO`,
+      range: `${sheetName}!A:AQ`,
       valueInputOption: "USER_ENTERED",
       insertDataOption: "INSERT_ROWS",
       requestBody: { values: appendData },
     });
   }
 
-  return { success: true, updatedCount: updateData.length, appendedCount: appendData.length };
+  return {
+    success: true,
+    updatedCount: updateData.length,
+    appendedCount: appendData.length,
+    skippedMissing,
+  };
 }
 
 export async function appendSingleConsultationLogToSheets(lead, log) {
   if (!lead || !log) return { success: false, reason: "NO_DATA" };
-  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1awaq6gNQspr-sjp-yuaH-Nu5JJmhyplVRevoaj47JZw";
+  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
   if (!spreadsheetId) return { success: false, reason: "NO_SPREADSHEET_ID" };
 
   const consultationSheetName = process.env.CRM_CONSULTATION_LOGS_SHEET_NAME || "Consultation Booked Logs";
@@ -513,7 +920,7 @@ export async function appendSingleConsultationLogToSheets(lead, log) {
 
 export async function appendSingleFollowUpLogToSheets(lead, log) {
   if (!lead || !log) return { success: false, reason: "NO_DATA" };
-  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1awaq6gNQspr-sjp-yuaH-Nu5JJmhyplVRevoaj47JZw";
+  const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
   if (!spreadsheetId) return { success: false, reason: "NO_SPREADSHEET_ID" };
 
   const followUpSheetName = process.env.CRM_FOLLOWUP_LOGS_SHEET_NAME || "Follow-up Logs";

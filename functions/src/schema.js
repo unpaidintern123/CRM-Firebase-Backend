@@ -32,6 +32,8 @@ export const leadUpdateSchema = z.object({
   totalSalesAmount: z.union([z.number(), z.string()]).optional(),
   notBookedFeedback: nullableString,
   orderDate: nullableString,
+  // Do not coerce missing → "" or Update Lead would wipe priority.
+  leadLabel: z.string().optional().nullable(),
   actor: nullableString,
   idempotencyKey: nullableString,
 });
@@ -57,7 +59,8 @@ export const inboundSyncSchema = z.object({
   limit: z.coerce.number().optional().nullable(),
   startRow: z.coerce.number().optional().default(2),
   allowBackendFallbackAssignment: z.boolean().optional().default(true),
-  skipExisting: z.boolean().optional().default(false),
+  // Firebase is source of truth: skip existing leads unless explicitly false (repair).
+  skipExisting: z.boolean().optional().default(true),
   triggeredBy: nullableString.optional().default("manual"),
 });
 
@@ -76,6 +79,7 @@ export const logsExportSyncSchema = z.object({
 export const adminSyncAssigneesSchema = z.object({
   activeAssignees: z.array(z.string()).default([]),
   mondayEligibleAssignees: z.array(z.string()).optional().default([]),
+  allUsersStatus: z.array(z.object({ username: z.string(), status: z.string() })).optional().default([]),
   source: nullableString.optional().default("google_sheet_users"),
   syncedBy: nullableString.optional().default("unknown"),
   usersSnapshot: z.array(z.any()).optional().default([]),

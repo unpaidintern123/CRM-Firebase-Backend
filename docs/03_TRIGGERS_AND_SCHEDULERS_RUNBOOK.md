@@ -57,7 +57,7 @@ Header auth:
 
 ### 3.1 `crm-consultation-visited-sync`
 
-- Schedule: `0 10-21 * * *` (Every hour at the top of the hour from 10:00 AM to 9:00 PM Asia/Kolkata).
+- Schedule: `*/30 10-21 * * *` (Every 30 minutes from 10:00 AM to 9:00 PM Asia/Kolkata).
 - Endpoint: `POST https://<your-run-host>/sync/consultation-visited`
 - Example body: `{"dryRun":false,"triggeredBy":"cloud_scheduler"}`
 

@@ -20,12 +20,6 @@ export async function checkLogin(loginDetail) {
   }
 
   const user = userSnap.data();
-  const status = String(user.status || "Active").trim();
-  if (status !== "Active") {
-    return {
-      message: "Your account is inactive. Please contact admin.",
-    };
-  }
 
   const valid = await verifyPassword(user, loginDetail.password);
   if (!valid) {

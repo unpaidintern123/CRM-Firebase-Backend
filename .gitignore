@@ -1,6 +1,9 @@
 node_modules/
+functions/node_modules/
 .env
 .env.local
 .DS_Store
 *.log
-functions/node_modules/
+*.txt
+*-adminsdk-*.json
+service-account*.json

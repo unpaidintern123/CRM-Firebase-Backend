@@ -11,12 +11,15 @@ function parseArg(name) {
 }
 
 const dryRun = process.argv.includes("--dry-run");
+// Default: create new sheet leads only. Pass --update-existing to overwrite from sheet (repair).
+const skipExisting = !process.argv.includes("--update-existing");
 const limitRaw = parseArg("limit");
 const limit = limitRaw != null ? Number(limitRaw) : null;
 
 try {
   const result = await syncLeadsSheetToFirestore({
     dryRun,
+    skipExisting,
     limit: Number.isFinite(limit) ? limit : null,
     triggeredBy: "cli",
   });

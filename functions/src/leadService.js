@@ -1,12 +1,19 @@
 import {
   updateSingleLeadRowInSheets,
+  updateLeadLabelInSheets,
   appendSingleConsultationLogToSheets,
   appendSingleFollowUpLogToSheets,
 } from "./sheetsExport.js";
 import { getFirestore } from "./firebase.js";
 import { ApiError } from "./errors.js";
 import { toLegacyLead } from "./mapper.js";
-import { firestoreDateToDisplayString } from "./sheetDateUtils.js";
+import {
+  firestoreDateToDisplayString,
+  normalizeDateToIso,
+  normalizeLeadDatesForWrite,
+  DATE_FIELDS,
+} from "./sheetDateUtils.js";
+import { assignLeadBackendRoundRobin } from "./sheetInboundSync.js";
 
 const FOLLOW_UP_STATUSES = new Set([
   "Warm Lead",
@@ -19,6 +26,10 @@ const FOLLOW_UP_STATUSES = new Set([
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function normalizeDateForCompare(value) {
+  return normalizeDateToIso(value) || "";
 }
 
 export async function getLeads(filters = {}) {
@@ -66,10 +77,14 @@ export async function getLegacyLeadsPayload(filters = {}) {
   return JSON.stringify(leads.map(toLegacyLead));
 }
 
-export async function updateLead(payload) {
+export async function updateLead(payload, options = {}) {
   const db = getFirestore();
   const leadRef = db.collection("leads").doc(payload.leadUniqueId);
   const idempotencyKey = payload.idempotencyKey || null;
+  // Prefer keys from the raw HTTP body so Zod defaults do not mark every column "changed".
+  const rawChangedKeys = Array.isArray(options.changedKeys)
+    ? options.changedKeys
+    : Object.keys(payload || {});
 
   const result = await db.runTransaction(async (tx) => {
     const leadSnap = await tx.get(leadRef);
@@ -78,25 +93,70 @@ export async function updateLead(payload) {
     }
 
     const current = leadSnap.data();
+
+    // Form update may omit priority and other non-form fields. Never let null/undefined
+    // (or blank for protected fields) wipe values already stored on the lead.
+    const sanitizedPayload = normalizeLeadDatesForWrite({ ...payload });
+    for (const key of Object.keys(sanitizedPayload)) {
+      if (sanitizedPayload[key] === undefined || sanitizedPayload[key] === null) {
+        delete sanitizedPayload[key];
+      }
+    }
+    const preserveIfBlank = [
+      "platform",
+      "callType",
+      "campaignname",
+      "adsetname",
+      "adname",
+      "campaignsource",
+      "placement",
+      "leadScore",
+      "leadQualification",
+      "consultationMode",
+      "preferredTimeToCall",
+      "firstContactTimestamp",
+      "secondaryMobileNo",
+    ];
+    for (const key of preserveIfBlank) {
+      if (
+        Object.prototype.hasOwnProperty.call(sanitizedPayload, key) &&
+        String(sanitizedPayload[key]).trim() === ""
+      ) {
+        delete sanitizedPayload[key];
+      }
+    }
+
+    // Merge incoming payload with current state to properly support partial updates
+    const mergedPayload = { ...current, ...sanitizedPayload };
+
     if (idempotencyKey && current.lastIdempotencyKey === idempotencyKey) {
       return { updatedLead: { ...current, leadUniqueId: leadRef.id }, noOp: true };
     }
 
     const followUpDateBefore = current.followUpDate || "";
     const consultationDateBefore = current.consutlationBookedDate || "";
-    let followUpDateValue = payload.followUpDate || "";
+    let followUpDateValue = mergedPayload.followUpDate || "";
 
-    if (["Lost", "Dead", "Not Visited Lost"].includes(payload.leadStatus)) {
+    // Only stamp follow-up date when status *becomes* Lost/Dead — not on every
+    // unrelated field patch (e.g. priority/label), which was creating extra log rows.
+    const previousStatus = String(current.leadStatus || "");
+    const nextStatus = String(mergedPayload.leadStatus || "");
+    const lostStatuses = ["Lost", "Dead", "Not Visited Lost"];
+    const becameLost =
+      lostStatuses.includes(nextStatus) && !lostStatuses.includes(previousStatus);
+    if (becameLost) {
       followUpDateValue = nowIso();
     }
 
-    const followUpChanged = followUpDateValue && followUpDateBefore !== followUpDateValue;
+    const followUpChanged =
+      Boolean(followUpDateValue) &&
+      normalizeDateForCompare(followUpDateBefore) !== normalizeDateForCompare(followUpDateValue);
     const followCountSnap = await tx.get(
-      db.collection("followUpLogs").where("leadUniqueId", "==", payload.leadUniqueId)
+      db.collection("followUpLogs").where("leadUniqueId", "==", mergedPayload.leadUniqueId)
     );
     const followUpCount = followCountSnap.size + (followUpChanged ? 1 : 0);
 
-    const safePayload = { ...payload };
+    const safePayload = { ...mergedPayload };
     // leadDate is treated as immutable in update flow; this prevents accidental
     // epoch-style corruption (e.g. 1970) when frontend payload carries bad date strings.
     delete safePayload.leadDate;
@@ -122,26 +182,28 @@ export async function updateLead(payload) {
     if (followUpChanged) {
       const followRef = db.collection("followUpLogs").doc();
       newFollowUpLog = {
-        leadUniqueId: payload.leadUniqueId,
+        leadUniqueId: mergedPayload.leadUniqueId,
         followUpDate: followUpDateValue,
-        leadStatus: payload.leadStatus || current.leadStatus || "",
-        remark: payload.detailComment || payload.initialRemark || "",
-        createdBy: payload.actor || payload.assignedTo || "system",
+        leadStatus: mergedPayload.leadStatus || "",
+        remark: mergedPayload.detailComment || mergedPayload.initialRemark || "",
+        createdBy: mergedPayload.actor || mergedPayload.assignedTo || "system",
         createdAt: nowIso(),
       };
       tx.set(followRef, newFollowUpLog);
     }
 
-    const consultationChanged = (payload.consutlationBookedDate || "") !== consultationDateBefore;
-    const shouldLogConsultation = consultationChanged && ["New", "Consultation Re-Booked"].includes(payload.consultationStatus || "");
+    const consultationChanged =
+      normalizeDateForCompare(mergedPayload.consutlationBookedDate || "") !==
+      normalizeDateForCompare(consultationDateBefore);
+    const shouldLogConsultation = consultationChanged && ["New", "Consultation Re-Booked"].includes(mergedPayload.consultationStatus || "");
     let newConsultationLog = null;
     if (shouldLogConsultation) {
       const consultationRef = db.collection("consultationLogs").doc();
       newConsultationLog = {
-        leadUniqueId: payload.leadUniqueId,
-        consultationBookedDate: payload.consutlationBookedDate,
-        consultationType: payload.consultationType || "",
-        createdBy: payload.actor || payload.assignedTo || "system",
+        leadUniqueId: mergedPayload.leadUniqueId,
+        consultationBookedDate: mergedPayload.consutlationBookedDate,
+        consultationType: mergedPayload.consultationType || "",
+        createdBy: mergedPayload.actor || mergedPayload.assignedTo || "system",
         createdAt: nowIso(),
       };
       tx.set(consultationRef, newConsultationLog);
@@ -149,32 +211,47 @@ export async function updateLead(payload) {
 
     const trackingRef = db.collection("leadStatusTracking").doc();
     tx.set(trackingRef, {
-      leadUniqueId: payload.leadUniqueId,
+      leadUniqueId: mergedPayload.leadUniqueId,
       previousStatus: current.leadStatus || "",
-      newStatus: payload.leadStatus || current.leadStatus || "",
-      changedBy: payload.actor || payload.assignedTo || "system",
+      newStatus: mergedPayload.leadStatus || "",
+      changedBy: mergedPayload.actor || mergedPayload.assignedTo || "system",
       createdAt: nowIso(),
       source: "updateLead",
     });
 
     const activityRef = db.collection("userActivityLogs").doc();
     tx.set(activityRef, {
-      leadUniqueId: payload.leadUniqueId,
+      leadUniqueId: mergedPayload.leadUniqueId,
       action: "LEAD_UPDATED",
-      actor: payload.actor || payload.assignedTo || "system",
+      actor: mergedPayload.actor || mergedPayload.assignedTo || "system",
       createdAt: nowIso(),
       metadata: {
-        fields: Object.keys(payload),
+        fields: Object.keys(payload), // intentionally keeping payload here to see which fields were touched
       },
     });
+
+    // Only sheet-patch fields that were actually present on the request (plus forced follow-up).
+    const rawKeySet = new Set(rawChangedKeys);
+    const changedFields = Object.keys(sanitizedPayload).filter(
+      (k) =>
+        rawKeySet.has(k) &&
+        !["leadUniqueId", "actor", "idempotencyKey", "leadDate"].includes(k)
+    );
+    if (followUpChanged || becameLost) {
+      if (!changedFields.includes("followUpDate")) changedFields.push("followUpDate");
+      if (!changedFields.includes("noOfFollowups")) changedFields.push("noOfFollowups");
+    }
 
     return {
       updatedLead: {
         ...current,
         ...updateDoc,
         noOfFollowups: followUpCount,
-        leadUniqueId: payload.leadUniqueId,
+        leadUniqueId: mergedPayload.leadUniqueId,
+        // Never trust a stale inbound sheet row number on the next write.
+        sheetRowNumber: undefined,
       },
+      changedFields,
       newFollowUpLog,
       newConsultationLog,
       noOp: false,
@@ -182,8 +259,10 @@ export async function updateLead(payload) {
   });
 
   if (!result.noOp && result.updatedLead) {
-    // Non-blocking background sync to Sheets so UI response is instant (~50ms)
-    updateSingleLeadRowInSheets(result.updatedLead).catch((err) => {
+    // Non-blocking: patch only changed columns so UI stays fast and other cells stay intact.
+    updateSingleLeadRowInSheets(result.updatedLead, {
+      changedFields: result.changedFields || [],
+    }).catch((err) => {
       console.error("Background single-row sheet update error:", err);
     });
 
@@ -206,6 +285,54 @@ export async function updateLead(payload) {
     // Commented out to prevent 5,000 Firestore reads per lead update:
     // impactedMetrics: await getDashboardMetrics({ assignedTo: result.updatedLead.assignedTo }),
     noOp: result.noOp,
+  };
+}
+
+/**
+ * Priority/label-only patch. Avoids full updateLead side effects (follow-up logs,
+ * status tracking noise, full sheet row rewrite/append).
+ */
+export async function updateLeadPriority({ leadUniqueId, leadLabel }) {
+  const id = String(leadUniqueId || "").trim();
+  const priority = String(leadLabel || "").trim();
+  if (!id) {
+    throw new ApiError(400, "MISSING_LEAD_ID", "Missing lead unique ID");
+  }
+
+  const db = getFirestore();
+  const leadRef = db.collection("leads").doc(id);
+  const snap = await leadRef.get();
+  if (!snap.exists) {
+    throw new ApiError(404, "LEAD_NOT_FOUND", `Lead ${id} not found`);
+  }
+
+  const current = snap.data() || {};
+  const updatedAt = nowIso();
+  await leadRef.set(
+    {
+      leadLabel: priority,
+      updatedAt,
+      crmUpdatedAt: updatedAt,
+    },
+    { merge: true }
+  );
+
+  const updatedLead = {
+    ...current,
+    leadUniqueId: id,
+    leadLabel: priority,
+    updatedAt,
+    crmUpdatedAt: updatedAt,
+  };
+
+  updateLeadLabelInSheets(updatedLead).catch((err) => {
+    console.error("Background lead-label sheet update error:", err);
+  });
+
+  return {
+    success: true,
+    updatedLead,
+    noOp: false,
   };
 }
 
@@ -326,9 +453,32 @@ export async function getLegacyConsultationPayload() {
 export async function createLead(payload) {
   const db = getFirestore();
   const now = nowIso();
-  const leadUniqueId =
-    payload.leadUniqueId ||
-    `Lead ID - ${Date.now()}`;
+
+  const normalized = normalizeLeadDatesForWrite({ ...(payload || {}) });
+
+  // Keep full clock time on every date field (same as Sheets / OG).
+  for (const fieldName of DATE_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(normalized, fieldName)) continue;
+    const raw = normalized[fieldName];
+    if (raw === null || raw === undefined || String(raw).trim() === "") {
+      normalized[fieldName] = "";
+      continue;
+    }
+    normalized[fieldName] = normalizeDateToIso(raw) || "";
+  }
+
+  // New leads always get a real leadDate with time (form datetime-local or now).
+  if (!normalized.leadDate) {
+    normalized.leadDate = now;
+  }
+  if (!normalized.firstContactTimestamp) {
+    normalized.firstContactTimestamp = now;
+  }
+
+  let leadUniqueId = String(normalized.leadUniqueId || payload?.leadUniqueId || "").trim();
+  if (!leadUniqueId) {
+    leadUniqueId = await allocateNextLeadId(db);
+  }
 
   const ref = db.collection("leads").doc(String(leadUniqueId));
   const snap = await ref.get();
@@ -336,33 +486,119 @@ export async function createLead(payload) {
     throw new ApiError(409, "LEAD_ALREADY_EXISTS", `Lead ${leadUniqueId} already exists`);
   }
 
-  const assignedTo = String(payload.assignedTo || "").trim();
-  const assignmentStatus = String(payload.assignmentStatus || "").trim();
-  const syncStatus = String(payload.syncStatus || "").trim();
+  let assignedTo = String(normalized.assignedTo || payload?.assignedTo || "").trim();
+  const assignmentStatus = String(normalized.assignmentStatus || payload?.assignmentStatus || "").trim();
+  const syncStatus = String(normalized.syncStatus || payload?.syncStatus || "").trim();
   const isPendingSyncLead = assignmentStatus === "pending" && syncStatus === "needs_assignment";
-  if (!assignedTo && !isPendingSyncLead) {
-    throw new ApiError(
-      400,
-      "ASSIGNED_TO_REQUIRED",
-      "assignedTo is required unless assignmentStatus=pending and syncStatus=needs_assignment"
-    );
+  const isExplicitUnassigned = assignedTo.toLowerCase() === "unassigned";
+
+  if (!assignedTo && !isPendingSyncLead && !isExplicitUnassigned) {
+    const roundRobinResult = await assignLeadBackendRoundRobin(db);
+    if (roundRobinResult && roundRobinResult.assignedTo) {
+      assignedTo = roundRobinResult.assignedTo;
+    } else {
+      console.warn("Auto-assignment warn:", roundRobinResult?.error || "No active assignees available");
+    }
+  }
+
+  if (isExplicitUnassigned) {
+    assignedTo = "Unassigned";
   }
 
   const doc = {
-    ...payload,
+    ...normalized,
     assignedTo,
     leadUniqueId,
+    leadStatus: normalized.leadStatus || "New Lead",
+    platform: normalized.platform || "",
+    callType: normalized.callType || "",
+    noOfFollowups: Number(normalized.noOfFollowups) || 0,
     createdAt: now,
     updatedAt: now,
+    assignmentStatus: assignmentStatus || (assignedTo ? "assigned" : "pending"),
+    syncStatus: syncStatus || (assignedTo ? "synced" : "needs_assignment"),
+    assignmentSource: normalized.assignmentSource || "crm_upload",
   };
   await ref.set(doc);
 
   await db.collection("userActivityLogs").add({
     action: "LEAD_CREATED",
     leadUniqueId,
-    actor: payload.actor || payload.assignedTo || "system",
+    actor: payload?.actor || assignedTo || "system",
     createdAt: now,
   });
 
+  // Mirror to sheets before returning so Cloud Run cannot drop unfinished writes,
+  // and so grid/append failures surface in the upload response path/logs.
+  const sheetJobs = [
+    updateSingleLeadRowInSheets(doc, { allowAppend: true }).catch((err) => {
+      console.error("Background new-lead sheet append error:", err);
+    }),
+  ];
+
+  if (doc.followUpDate) {
+    const followLog = {
+      leadUniqueId,
+      followUpDate: doc.followUpDate,
+      leadStatus: doc.leadStatus || "",
+      remark: doc.detailComment || doc.initialRemark || "",
+      createdBy: payload?.actor || assignedTo || "system",
+      createdAt: now,
+    };
+    sheetJobs.push(
+      db
+        .collection("followUpLogs")
+        .add(followLog)
+        .then(() => appendSingleFollowUpLogToSheets(doc, followLog))
+        .catch((err) => console.error("New-lead follow-up log error:", err))
+    );
+  }
+
+  if (
+    doc.consutlationBookedDate &&
+    ["New", "Consultation Re-Booked"].includes(String(doc.consultationStatus || ""))
+  ) {
+    const consLog = {
+      leadUniqueId,
+      consultationBookedDate: doc.consutlationBookedDate,
+      consultationType: doc.consultationType || "",
+      createdBy: payload?.actor || assignedTo || "system",
+      createdAt: now,
+    };
+    sheetJobs.push(
+      db
+        .collection("consultationLogs")
+        .add(consLog)
+        .then(() => appendSingleConsultationLogToSheets(doc, consLog))
+        .catch((err) => console.error("New-lead consultation log error:", err))
+    );
+  }
+
+  await Promise.all(sheetJobs);
+
   return { success: true, leadUniqueId, lead: doc };
+}
+
+/**
+ * Allocates next Lead ID using an atomic transaction on config/leadIds counter.
+ * Fast (10ms), eliminates 25,000+ Firestore reads per lead, and avoids Google Sheets API latency.
+ */
+async function allocateNextLeadId(db) {
+  const counterRef = db.collection("config").doc("leadIds");
+  const nextNum = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(counterRef);
+    let next = snap.exists ? Number(snap.data()?.nextId) : 1;
+    if (!Number.isFinite(next) || next < 1) next = 1;
+
+    tx.set(
+      counterRef,
+      {
+        nextId: next + 1,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+    return next;
+  });
+  return `Lead ID - ${nextNum}`;
 }

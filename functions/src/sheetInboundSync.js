@@ -1,54 +1,33 @@
 import { google } from "googleapis";
 import { getFirestore } from "./firebase.js";
 import { LEAD_FIELD_MAP } from "./mapper.js";
-import { normalizeLeadDatesFromSheet } from "./sheetDateUtils.js";
+import {
+  DATE_FIELDS,
+  normalizeDateToIso,
+  normalizeLeadDatesFromSheet,
+} from "./sheetDateUtils.js";
 
-const CRM_PROTECTED_FIELDS = new Set([
-  "leadStatus",
-  "detailComment",
-  "comment",
-  "followUpDate",
-  "nextFollowUpDate",
-  "lastFollowUpDate",
-  "consultationStatus",
-  "noOfFollowups",
-  "assignedTo",
-  "assignedAt",
+/**
+ * Firebase is source of truth for existing leads.
+ * Inbound sync creates new sheet rows only (skipExisting defaults true).
+ * If skipExisting is forced false (rare repair), these server/meta fields still never overwrite.
+ */
+const NEVER_OVERWRITE_FROM_SHEET = new Set([
+  "leadUniqueId",
+  "createdAt",
   "updatedAt",
   "updatedBy",
   "crmUpdatedAt",
-]);
-
-const INGEST_OWNED_FIELDS = new Set([
-  "leadDate",
-  "clientName",
-  "mobileNo",
-  "secondaryMobileNo",
-  "city",
-  "town",
-  "callType",
-  "platform",
-  "rating",
-  "interestedIn",
-  "consutlationBookedDate",
-  "consutlationVisitedDate",
-  "consultationType",
-  "initialRemark",
-  "Q1",
-  "Q2",
-  "Q3",
-  "hearAboutUs",
-  "orderStatus",
-  "totalSalesAmount",
-  "notBookedFeedback",
-  "orderDate",
-  "campaignname",
-  "adsetname",
-  "adname",
-  "campaignsource",
-  "placement",
-  "preferredTimeToCall",
-  "consultationMode",
+  "assignedAt",
+  "lastIdempotencyKey",
+  "syncSource",
+  "sheetSyncedAt",
+  "sourceLastSyncedAt",
+  "sheetRowNumber",
+  "lastInboundSyncAt",
+  "lastInboundSyncBy",
+  "dateTimeRepairedAt",
+  "dateTimeRepairedFrom",
 ]);
 
 const HEADER_ALIASES = {
@@ -137,17 +116,29 @@ function buildUpdateDoc(current, incoming, meta) {
   };
 
   Object.keys(incoming).forEach((key) => {
-    if (key === "leadUniqueId") return;
-    if (CRM_PROTECTED_FIELDS.has(key)) return;
-    if (!INGEST_OWNED_FIELDS.has(key)) return;
+    if (NEVER_OVERWRITE_FROM_SHEET.has(key)) return;
     const currentValue = current[key];
     const incomingValue = incoming[key];
-    if ((currentValue === undefined || currentValue === null || currentValue === "") && incomingValue !== "") {
-      patch[key] = incomingValue;
+    const incomingNonEmpty =
+      incomingValue !== undefined &&
+      incomingValue !== null &&
+      String(incomingValue).trim() !== "";
+    if (!incomingNonEmpty) return; // never clear Firebase with blank sheet cells
+
+    // Repair path only (skipExisting=false): sheet fills non-empty diffs.
+    if (DATE_FIELDS.has(key)) {
+      const incomingIso = normalizeDateToIso(incomingValue);
+      if (!incomingIso) return;
+      if (normalizeDateToIso(currentValue) !== incomingIso) {
+        patch[key] = incomingIso;
+      }
       return;
     }
-    if (incomingValue !== "" && currentValue !== incomingValue && current.crmUpdatedAt == null) {
-      patch[key] = incomingValue;
+
+    const normalizedIncoming =
+      typeof incomingValue === "string" ? incomingValue.trim() : incomingValue;
+    if (String(currentValue ?? "").trim() !== String(normalizedIncoming).trim()) {
+      patch[key] = normalizedIncoming;
     }
   });
 
@@ -171,12 +162,31 @@ export async function assignLeadBackendRoundRobin(dbParam = null) {
   return db.runTransaction(async (tx) => {
     const snap = await tx.get(configRef);
     const data = snap.exists ? snap.data() : {};
-    const assignees = Array.isArray(data.activeAssignees)
+
+    // Match Apps Script assignLeads(): Mon = Active+Coming; other days = Active only.
+    // Use Asia/Kolkata so "Monday" matches CRM business day.
+    const weekday = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Asia/Kolkata",
+      weekday: "short",
+    }).format(new Date());
+    const isMonday = weekday === "Mon";
+
+    const activeAssignees = Array.isArray(data.activeAssignees)
       ? data.activeAssignees.map((a) => String(a || "").trim()).filter(Boolean)
       : [];
+    const mondayAssignees = Array.isArray(data.mondayEligibleAssignees)
+      ? data.mondayEligibleAssignees.map((a) => String(a || "").trim()).filter(Boolean)
+      : [];
+
+    const assignees = isMonday ? mondayAssignees : activeAssignees;
 
     if (!assignees.length) {
-      return { assignedTo: null, error: "No active assignees configured" };
+      return {
+        assignedTo: null,
+        error: isMonday
+          ? "No Monday-eligible (Active + Coming) assignees configured"
+          : "No active assignees configured",
+      };
     }
 
     const rawIndex = Number.isInteger(data.lastAssignedIndex) ? data.lastAssignedIndex : -1;
@@ -187,7 +197,8 @@ export async function assignLeadBackendRoundRobin(dbParam = null) {
     tx.set(
       configRef,
       {
-        activeAssignees: assignees,
+        activeAssignees,
+        mondayEligibleAssignees: mondayAssignees,
         lastAssignedIndex: nextIndex,
         updatedAt: nowIso(),
       },
@@ -205,7 +216,8 @@ export async function syncLeadsSheetToFirestore(options = {}) {
     limit = null,
     startRow = 2,
     allowBackendFallbackAssignment = true,
-    skipExisting = false,
+    // Default: import new sheet leads only; never modify existing Firebase docs.
+    skipExisting = true,
     triggeredBy = "manual",
   } = options;
 
@@ -235,10 +247,14 @@ export async function syncLeadsSheetToFirestore(options = {}) {
 
   const auth = getGoogleAuth();
   const sheets = google.sheets({ version: "v4", auth });
-  const readRange = `${sheetName}!A:AO`;
+  const readRange = `${sheetName}!A:AQ`;
+  // UNFORMATTED_VALUE keeps Sheets serials with fractional time (visit/booked clock).
+  // FORMATTED_VALUE often returns date-only display text and drops time into Firebase.
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range: readRange,
+    valueRenderOption: "UNFORMATTED_VALUE",
+    dateTimeRenderOption: "SERIAL_NUMBER",
   });
   const rows = response.data.values || [];
   if (!rows.length) {
@@ -302,29 +318,12 @@ export async function syncLeadsSheetToFirestore(options = {}) {
       const incoming = { ...lead };
       let syncStatus = "synced";
 
-      if (!incoming.assignedTo) {
-        if (allowBackendFallbackAssignment) {
-          const fallback = await assignLeadBackendRoundRobin(db);
-          if (fallback.assignedTo) {
-            incoming.assignedTo = fallback.assignedTo;
-            incoming.assignedAt = syncedAt;
-            incoming.assignmentSource = "backend_sheet_sync_fallback";
-            incoming.assignmentStatus = "assigned";
-            summary.backendAssigned += 1;
-          } else {
-            incoming.assignmentStatus = "pending";
-            incoming.assignmentError = fallback.error || "Assignment failed";
-            syncStatus = "needs_assignment";
-            summary.assignmentPending += 1;
-            summary.skippedBlankAssignedTo += 1;
-          }
-        } else {
-          incoming.assignmentStatus = "pending";
-          incoming.assignmentError = "assignedTo blank in sheet and backend fallback disabled";
-          syncStatus = "needs_assignment";
-          summary.assignmentPending += 1;
-          summary.skippedBlankAssignedTo += 1;
-        }
+      if (!incoming.assignedTo || incoming.assignedTo.trim().toLowerCase() === "unassigned") {
+        incoming.assignedTo = "Unassigned";
+        incoming.assignmentStatus = "pending";
+        incoming.assignmentSource = "sheet_unassigned";
+        summary.assignmentPending += 1;
+        summary.skippedBlankAssignedTo += 1;
       } else {
         incoming.assignedAt = incoming.assignedAt || syncedAt;
         incoming.assignmentSource = incoming.assignmentSource || "sheet";

@@ -2,9 +2,7 @@ import { updateMultipleLeadRowsInSheets } from "./sheetsExport.js";
 import { google } from "googleapis";
 import { getFirestore } from "./firebase.js";
 import { ApiError } from "./errors.js";
-
-const DAY_MS = 86400000;
-const SHEETS_EPOCH_MS = Date.UTC(1899, 11, 30);
+import { normalizeDateToIso } from "./sheetDateUtils.js";
 
 function nowIso() {
   return new Date().toISOString();
@@ -33,14 +31,7 @@ function normalizeMobile(value) {
 }
 
 function parseSheetsDateValue(value) {
-  if (value === null || value === undefined || value === "") return "";
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return new Date(SHEETS_EPOCH_MS + value * DAY_MS).toISOString();
-  }
-  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString();
-  const t = Date.parse(String(value));
-  if (!Number.isNaN(t)) return new Date(t).toISOString();
-  return "";
+  return normalizeDateToIso(value);
 }
 
 function toMs(iso) {
@@ -148,6 +139,7 @@ export async function syncConsultationVisitedLeads(options = {}) {
   }
 
   const db = getFirestore();
+  // Exact status string required (same as CRM UI option value).
   const snap = await db.collection("leads").where("leadStatus", "==", "Consultation Booked").get();
   const docs = limit != null ? snap.docs.slice(0, Number(limit)) : snap.docs;
   summary.scannedBookedLeads = docs.length;
@@ -155,6 +147,13 @@ export async function syncConsultationVisitedLeads(options = {}) {
   const updates = [];
   for (const doc of docs) {
     const lead = doc.data() || {};
+    const status = String(lead.leadStatus || "").trim();
+    // Extra spaces / wrong casing would have been excluded by the query already;
+    // keep an explicit guard for clarity.
+    if (status !== "Consultation Booked") {
+      continue;
+    }
+
     const mobile = normalizeMobile(lead.mobileNo);
     if (!mobile) {
       summary.leadsWithInvalidMobile += 1;
@@ -259,8 +258,17 @@ export async function syncConsultationVisitedLeads(options = {}) {
     try {
       const updatedIds = updates.map((u) => String(u.leadUniqueId)).filter(Boolean);
       if (updatedIds.length) {
-        const updatedSnaps = await db.getAll(...updatedIds.map((id) => db.collection("leads").doc(id)));
-        const updatedLeads = updatedSnaps.filter((s) => s.exists).map((s) => s.data());
+        const updatedLeads = [];
+        // Firestore getAll is safest in chunks of 100.
+        for (let i = 0; i < updatedIds.length; i += 100) {
+          const chunk = updatedIds.slice(i, i + 100);
+          const updatedSnaps = await db.getAll(...chunk.map((id) => db.collection("leads").doc(id)));
+          for (const s of updatedSnaps) {
+            if (!s.exists) continue;
+            // Always include doc id — some leads omit leadUniqueId field on the document body.
+            updatedLeads.push({ ...s.data(), leadUniqueId: s.id });
+          }
+        }
         await updateMultipleLeadRowsInSheets(updatedLeads);
       }
     } catch (err) {

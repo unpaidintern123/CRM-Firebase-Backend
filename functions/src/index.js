@@ -19,6 +19,7 @@ import {
   getLegacyLeadsPayload,
   getLeads,
   updateLead,
+  updateLeadPriority,
 } from "./leadService.js";
 import { runEndOfDaySync, runLogsExportSync } from "./sheetsExport.js";
 import { syncLeadsSheetToFirestore } from "./sheetInboundSync.js";
@@ -133,14 +134,32 @@ export const api = onRequest(
     if (method === "PATCH" && path.startsWith("/leads/")) {
       const leadUniqueId = decodeURIComponent(path.split("/")[2] || "");
       if (!leadUniqueId) throw new ApiError(400, "MISSING_LEAD_ID", "Missing lead id");
-      const payload = leadUpdateSchema.parse({ ...req.body, leadUniqueId });
-      const data = await updateLead(payload);
+      const rawBody = req.body || {};
+      const payload = leadUpdateSchema.parse({ ...rawBody, leadUniqueId });
+      const data = await updateLead(payload, {
+        changedKeys: [...Object.keys(rawBody), "leadUniqueId"],
+      });
       return sendJson(res, 200, data);
     }
 
     if (method === "POST" && path === "/gas/updateLeadDetails") {
-      const payload = leadUpdateSchema.parse(req.body || {});
-      const data = await updateLead(payload);
+      const rawBody = req.body || {};
+      const payload = leadUpdateSchema.parse(rawBody);
+      const data = await updateLead(payload, {
+        changedKeys: Object.keys(rawBody),
+      });
+      return sendJson(res, 200, {
+        success: true,
+        data,
+      });
+    }
+
+    if (method === "POST" && path === "/gas/updateLeadPriority") {
+      const { leadUniqueId, selectedPriority, leadPriority, leadLabel } = req.body || {};
+      const priority = selectedPriority || leadPriority || leadLabel;
+      if (!leadUniqueId) throw new ApiError(400, "MISSING_LEAD_ID", "Missing lead unique ID");
+
+      const data = await updateLeadPriority({ leadUniqueId, leadLabel: priority });
       return sendJson(res, 200, {
         success: true,
         data,
@@ -218,6 +237,23 @@ export const api = onRequest(
           },
           { merge: true }
         );
+
+        (body.allUsersStatus || []).forEach((u) => {
+          if (u.username) {
+            const uRef = db.collection("users").doc(String(u.username).trim());
+            tx.set(uRef, { status: u.status || "Inactive", updatedAt: now }, { merge: true });
+          }
+        });
+
+        removedAssignees.forEach((name) => {
+          const uRef = db.collection("users").doc(name);
+          tx.set(uRef, { status: "Inactive", updatedAt: now }, { merge: true });
+        });
+
+        incoming.forEach((name) => {
+          const uRef = db.collection("users").doc(name);
+          tx.set(uRef, { status: "Active", updatedAt: now }, { merge: true });
+        });
 
         return {
           activeAssignees: incoming,

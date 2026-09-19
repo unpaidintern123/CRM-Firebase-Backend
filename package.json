@@ -25,6 +25,7 @@
     "sync:consultation-visited": "node scripts/sync-consultation-visited.mjs",
     "sync:order-match": "node scripts/sync-order-match.mjs",
     "verify:parity": "node scripts/verify-parity.mjs",
-    "perf:update": "node scripts/perf-update-lead.mjs"
+    "perf:update": "node scripts/perf-update-lead.mjs",
+    "repair:datetimes": "node scripts/repair-lead-datetimes.mjs"
   }
 }
