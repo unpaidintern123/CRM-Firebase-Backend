@@ -2,6 +2,8 @@ import { google } from "googleapis";
 import { getFirestore } from "./firebase.js";
 import { ApiError } from "./errors.js";
 
+import { normalizeDateToIso } from "./sheetDateUtils.js";
+
 const DEFAULT_ORDER_SPREADSHEET_ID = "1BWQb_mxcwH6XCRpNYWCM_J3fYgZZ3Uq5hshqM0_d0l0";
 const DEFAULT_ORDER_SHEET_NAME = "Order Forms";
 
@@ -24,25 +26,15 @@ function normalizeMobile(value) {
   if (!raw) return "";
   if (/^\d+\.0$/.test(raw)) raw = raw.replace(/\.0$/, "");
   let digits = raw.replace(/\D/g, "");
+  if (!digits) return "";
   if (digits.startsWith("00")) digits = digits.slice(2);
   if (digits.length === 12 && digits.startsWith("91")) digits = digits.slice(2);
   if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
-  if (!/^\d{10}$/.test(digits)) return "";
   return digits;
 }
 
 function parseOrderDate(value) {
-  if (value instanceof Date && !Number.isNaN(value.getTime())) {
-    return value.toISOString();
-  }
-  if (typeof value === "number" && Number.isFinite(value)) {
-    const DAY_MS = 86400000;
-    const SHEETS_EPOCH_MS = Date.UTC(1899, 11, 30);
-    return new Date(SHEETS_EPOCH_MS + value * DAY_MS).toISOString();
-  }
-  const t = Date.parse(String(value));
-  if (!Number.isNaN(t)) return new Date(t).toISOString();
-  return "";
+  return normalizeDateToIso(value);
 }
 
 /**

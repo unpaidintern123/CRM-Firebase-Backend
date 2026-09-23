@@ -23,10 +23,10 @@ function normalizeMobile(value) {
   if (!raw) return "";
   if (/^\d+\.0$/.test(raw)) raw = raw.replace(/\.0$/, "");
   let digits = raw.replace(/\D/g, "");
+  if (!digits) return "";
   if (digits.startsWith("00")) digits = digits.slice(2);
   if (digits.length === 12 && digits.startsWith("91")) digits = digits.slice(2);
   if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
-  if (!/^\d{10}$/.test(digits)) return "";
   return digits;
 }
 

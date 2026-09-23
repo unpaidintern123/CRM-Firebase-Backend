@@ -569,7 +569,8 @@ function normalizeLeadId(value) {
 
 async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead) {
   const cleanTargetId = normalizeLeadId(lead?.leadUniqueId);
-  const targetMobile = String(lead?.mobileNo || "").replace(/\D/g, "").slice(-10);
+  const targetDigits = String(lead?.mobileNo || "").replace(/\D/g, "");
+  const targetMobile10 = targetDigits.slice(-10);
 
   const candidateRows = [];
   if (typeof lead?.sheetRowNumber === "number" && lead.sheetRowNumber > 1) {
@@ -578,6 +579,14 @@ async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead) {
   if (cleanTargetId && leadRowCacheMap.has(cleanTargetId)) {
     candidateRows.push(leadRowCacheMap.get(cleanTargetId));
   }
+
+  const matchesPhone = (rowPhone) => {
+    const digits = String(rowPhone || "").replace(/\D/g, "");
+    if (!digits || !targetDigits) return false;
+    if (digits === targetDigits) return true;
+    if (targetMobile10 && digits.slice(-10) === targetMobile10) return true;
+    return false;
+  };
 
   // Verify cached/stale sheetRowNumber still points at THIS lead before using it.
   for (const candidate of candidateRows) {
@@ -588,14 +597,12 @@ async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead) {
       });
       const row = (probe.data.values && probe.data.values[0]) || [];
       const cleanIdVal = normalizeLeadId(row[0]);
-      const mobileVal = String(row[2] || "").replace(/\D/g, "").slice(-10);
+      const mobileVal = row[2];
       if (cleanTargetId && cleanIdVal === cleanTargetId) {
         return candidate;
       }
       if (
-        targetMobile &&
-        mobileVal &&
-        mobileVal === targetMobile &&
+        matchesPhone(mobileVal) &&
         (!cleanIdVal || cleanIdVal === cleanTargetId)
       ) {
         return candidate;
@@ -613,15 +620,13 @@ async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead) {
   for (let i = 1; i < rows.length; i++) {
     const idVal = String(rows[i]?.[0] || "").trim().toLowerCase();
     const cleanIdVal = normalizeLeadId(idVal);
-    const mobileVal = String(rows[i]?.[2] || "").replace(/\D/g, "").slice(-10);
+    const mobileVal = rows[i]?.[2];
 
     if (cleanTargetId && cleanIdVal === cleanTargetId) {
       return i + 1;
     }
     if (
-      targetMobile &&
-      mobileVal &&
-      mobileVal === targetMobile &&
+      matchesPhone(mobileVal) &&
       (!cleanIdVal || cleanIdVal === cleanTargetId)
     ) {
       return i + 1;
