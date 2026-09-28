@@ -154,6 +154,37 @@ export const api = onRequest(
       });
     }
 
+    if (method === "POST" && (path === "/gas/updateConsultationVisitedDate" || path === "/gas/updateLeadDate")) {
+      const rawBody = req.body || {};
+      const { leadUniqueId, consutlationVisitedDate, dateField, newDateValue, dateValue, actor } = rawBody;
+      if (!leadUniqueId) throw new ApiError(400, "MISSING_LEAD_ID", "Missing lead unique ID");
+
+      const targetField = dateField || "consutlationVisitedDate";
+      const targetVal =
+        newDateValue !== undefined
+          ? newDateValue
+          : consutlationVisitedDate !== undefined
+          ? consutlationVisitedDate
+          : dateValue;
+
+      const updatePayload = {
+        ...rawBody,
+        leadUniqueId,
+        [targetField]: targetVal || "",
+        actor: actor || "sheet_admin_menu",
+      };
+
+      const payload = leadUpdateSchema.parse(updatePayload);
+      const data = await updateLead(payload, {
+        changedKeys: [targetField, "leadUniqueId", "actor"],
+      });
+
+      return sendJson(res, 200, {
+        success: true,
+        data,
+      });
+    }
+
     if (method === "POST" && path === "/gas/updateLeadPriority") {
       const { leadUniqueId, selectedPriority, leadPriority, leadLabel } = req.body || {};
       const priority = selectedPriority || leadPriority || leadLabel;
