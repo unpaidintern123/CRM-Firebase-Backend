@@ -94,11 +94,12 @@ export async function updateLead(payload, options = {}) {
 
     const current = leadSnap.data();
 
-    // Form update may omit priority and other non-form fields. Never let null/undefined
-    // (or blank for protected fields) wipe values already stored on the lead.
+    // Form update or partial patch: only allow fields that were explicitly sent in changedKeys
+    // to overwrite existing values. This prevents Zod empty string defaults from wiping untouched fields.
+    const rawKeySet = new Set(rawChangedKeys);
     const sanitizedPayload = normalizeLeadDatesForWrite({ ...payload });
     for (const key of Object.keys(sanitizedPayload)) {
-      if (sanitizedPayload[key] === undefined || sanitizedPayload[key] === null) {
+      if (!rawKeySet.has(key) || sanitizedPayload[key] === undefined || sanitizedPayload[key] === null) {
         delete sanitizedPayload[key];
       }
     }
@@ -231,7 +232,6 @@ export async function updateLead(payload, options = {}) {
     });
 
     // Only sheet-patch fields that were actually present on the request (plus forced follow-up).
-    const rawKeySet = new Set(rawChangedKeys);
     const changedFields = Object.keys(sanitizedPayload).filter(
       (k) =>
         rawKeySet.has(k) &&
