@@ -14,6 +14,7 @@ import {
   DATE_FIELDS,
 } from "./sheetDateUtils.js";
 import { assignLeadBackendRoundRobin } from "./sheetInboundSync.js";
+import { pushLeadToOneinbox } from "./oneinboxSync.js";
 
 const FOLLOW_UP_STATUSES = new Set([
   "Warm Lead",
@@ -277,6 +278,9 @@ export async function updateLead(payload, options = {}) {
         console.error("Background consultation log sheet append error:", err);
       });
     }
+
+    // Best-effort oneinbox stage sync — never blocks CRM / Sheets.
+    void pushLeadToOneinbox(result.updatedLead);
   }
 
   return {

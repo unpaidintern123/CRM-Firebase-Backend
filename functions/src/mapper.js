@@ -44,6 +44,10 @@ export const LEAD_FIELD_MAP = {
   "first contact timestamp": "firstContactTimestamp",
   "client preference consultation mode": "consultationMode",
   "lead label": "leadLabel",
+  email: "email",
+  Email: "email",
+  query: "query",
+  Query: "query",
 };
 
 export function toLegacyLead(doc) {
@@ -91,5 +95,9 @@ export function toLegacyLead(doc) {
     "preferred time to call": doc.preferredTimeToCall || "",
     "first contact timestamp": firestoreDateToDisplayString(doc.firstContactTimestamp) || "",
     "client preference consultation mode": doc.consultationMode || "",
+    email: doc.email || "",
+    Email: doc.email || "",
+    query: doc.query || "",
+    Query: doc.query || "",
   };
 }

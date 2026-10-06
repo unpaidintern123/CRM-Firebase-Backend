@@ -152,6 +152,8 @@ function toRow(lead) {
     lead.preferredTimeToCall || "",
     cellDate(lead.firstContactTimestamp),
     lead.leadLabel || "",
+    cellText(lead.email),
+    cellText(lead.query),
   ];
 }
 
@@ -383,7 +385,7 @@ export async function runEndOfDaySync({ dryRun = false } = {}) {
   const leads = await getLeads({ limit: 10000 });
   const rows = leads.map(toRow);
   const sheetName = process.env.CRM_LEADS_SHEET_NAME || "Leads Data";
-  const clearedRange = `${sheetName}!A2:AQ`;
+  const clearedRange = `${sheetName}!A2:AS`;
   const updatedRange = `${sheetName}!A2`;
 
   if (dryRun) {
@@ -402,6 +404,26 @@ export async function runEndOfDaySync({ dryRun = false } = {}) {
   const auth = getGoogleAuth();
   const sheets = google.sheets({ version: "v4", auth });
   const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
+
+  // Ensure row 1 has Email and Query headers automatically
+  try {
+    const headerResp = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${sheetName}!1:1`,
+    });
+    const headers = (headerResp.data.values && headerResp.data.values[0]) || [];
+    const hLower = headers.map((h) => String(h || "").trim().toLowerCase());
+    if (!hLower.includes("email") || !hLower.includes("query")) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `${sheetName}!AR1:AS1`,
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values: [["Email", "Query"]] },
+      });
+    }
+  } catch (hdrErr) {
+    console.warn("Could not auto-check headers in Leads Data:", hdrErr);
+  }
 
   await sheets.spreadsheets.values.clear({
     spreadsheetId,
@@ -750,7 +772,26 @@ export async function patchLeadFieldsInSheets(lead, changedFields = []) {
   const missingHeaders = [];
   for (const field of fields) {
     const headerName = FIELD_TO_HEADER[field];
-    const colIdx = headerIndex.get(String(headerName).toLowerCase());
+    let colIdx = headerIndex.get(String(headerName).toLowerCase());
+    if (colIdx === undefined) {
+      // Automatically add Email / Query headers if missing
+      if (field === "email" || field === "query") {
+        colIdx = field === "email" ? 43 : 44; // Col AR (43) or AS (44)
+        const colLetter = columnIndexToA1(colIdx);
+        try {
+          await sheets.spreadsheets.values.update({
+            spreadsheetId,
+            range: `${sheetName}!${colLetter}1`,
+            valueInputOption: "USER_ENTERED",
+            requestBody: { values: [[headerName]] },
+          });
+          headerIndex.set(String(headerName).toLowerCase(), colIdx);
+        } catch (hdrErr) {
+          console.warn(`Could not auto-add header ${headerName}:`, hdrErr);
+        }
+      }
+    }
+
     if (colIdx === undefined) {
       missingHeaders.push(headerName);
       continue;

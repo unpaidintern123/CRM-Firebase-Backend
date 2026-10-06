@@ -2,6 +2,7 @@ import { onRequest } from "firebase-functions/v2/https";
 import cors from "cors";
 import { config as dotenvConfig } from "dotenv";
 import { ApiError, errorResponse } from "./errors.js";
+// ONEINBOX_WEBHOOK_URL comes from functions/.env (loaded by Firebase + dotenv below).
 import {
   adminSyncAssigneesSchema,
   consultationVisitedSyncSchema,

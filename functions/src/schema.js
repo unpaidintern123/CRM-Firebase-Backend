@@ -34,6 +34,8 @@ export const leadUpdateSchema = z.object({
   orderDate: nullableString,
   // Do not coerce missing → "" or Update Lead would wipe priority.
   leadLabel: z.string().optional().nullable(),
+  email: nullableString,
+  query: nullableString,
   actor: nullableString,
   idempotencyKey: nullableString,
 });
