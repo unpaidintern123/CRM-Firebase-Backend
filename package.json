@@ -23,6 +23,7 @@
     "export:logs": "node scripts/export-logs-to-sheets.mjs",
     "sync:sheet-to-firestore": "node scripts/sync-sheet-to-firestore.mjs",
     "sync:consultation-visited": "node scripts/sync-consultation-visited.mjs",
+    "sync:users-full": "node scripts/sync-all-users-complete.mjs",
     "sync:order-match": "node scripts/sync-order-match.mjs",
     "verify:parity": "node scripts/verify-parity.mjs",
     "perf:update": "node scripts/perf-update-lead.mjs",

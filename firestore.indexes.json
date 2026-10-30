@@ -5,6 +5,30 @@
       "queryScope": "COLLECTION",
       "fields": [
         { "fieldPath": "assignedTo", "order": "ASCENDING" },
+        { "fieldPath": "leadStatus", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "leads",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assignedTo", "order": "ASCENDING" },
+        { "fieldPath": "updatedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "leads",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assignedTo", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "leads",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assignedTo", "order": "ASCENDING" },
         { "fieldPath": "leadStatus", "order": "ASCENDING" },
         { "fieldPath": "followUpDate", "order": "ASCENDING" }
       ]

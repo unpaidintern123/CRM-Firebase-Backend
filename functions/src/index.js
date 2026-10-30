@@ -21,6 +21,7 @@ import {
   getLeads,
   updateLead,
   updateLeadPriority,
+  invalidateLeadsCache,
 } from "./leadService.js";
 import { runEndOfDaySync, runLogsExportSync } from "./sheetsExport.js";
 import { syncLeadsSheetToFirestore } from "./sheetInboundSync.js";
@@ -91,12 +92,13 @@ export const api = onRequest(
 
     if (method === "GET" && path === "/gas/retriveLeadData2") {
       const query = leadsQuerySchema.parse(req.query || {});
-      const leads = await getLeads(query);
-      return sendJson(res, 200, { success: true, data: JSON.stringify(leads.map(toLegacyLead)) });
+      const data = await getLegacyLeadsPayload(query);
+      return sendJson(res, 200, { success: true, data });
     }
 
     if (method === "GET" && path === "/gas/retriveConsData") {
-      const data = await getLegacyConsultationPayload();
+      const query = leadsQuerySchema.parse(req.query || {});
+      const data = await getLegacyConsultationPayload(query);
       return sendJson(res, 200, { success: true, data });
     }
 
@@ -126,6 +128,7 @@ export const api = onRequest(
         dryRun,
         triggeredBy: "gas_checkAndMatchOrder",
       });
+      if (!dryRun) invalidateLeadsCache();
       return sendJson(res, 200, {
         success: true,
         data: formatOrderMatchSuccessMessage(summary),
@@ -198,7 +201,7 @@ export const api = onRequest(
       });
     }
 
-    if (method === "GET" && path === "/dashboard/metrics") {
+    if (method === "GET" && (path === "/dashboard/metrics" || path === "/gas/getStageCounts" || path === "/gas/getMetrics")) {
       const metrics = await getDashboardMetrics(req.query || {});
       return sendJson(res, 200, { success: true, data: metrics });
     }
@@ -221,6 +224,9 @@ export const api = onRequest(
         ...body,
         triggeredBy: body.triggeredBy || "http",
       });
+      if (!body.dryRun && (result.created > 0 || result.updated > 0)) {
+        invalidateLeadsCache();
+      }
       return sendJson(res, 200, { success: true, data: result });
     }
 
@@ -230,6 +236,9 @@ export const api = onRequest(
         ...body,
         triggeredBy: body.triggeredBy || "http",
       });
+      if (!body.dryRun && result.updatedCount > 0) {
+        invalidateLeadsCache();
+      }
       return sendJson(res, 200, { success: true, data: result });
     }
 

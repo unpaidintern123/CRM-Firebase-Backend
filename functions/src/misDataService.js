@@ -33,11 +33,30 @@ function parseWeekEndDate(value) {
   return null;
 }
 
+let misDataCache = {
+  data: null,
+  cachedAt: 0,
+};
+const MIS_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+export function invalidateMisDataCache() {
+  misDataCache = { data: null, cachedAt: 0 };
+}
+
 /**
  * Mirrors dashboardCal.js getLatestWeekEndData — returns rows for the MIS week
  * closest to today. Frontend expects JSON.stringify(row[]) with name at [0], score at [3].
  */
-export async function getLatestWeekEndData() {
+export async function getLatestWeekEndData(options = {}) {
+  const now = Date.now();
+  if (
+    !options.forceRefresh &&
+    misDataCache.data &&
+    now - misDataCache.cachedAt < MIS_CACHE_TTL_MS
+  ) {
+    return misDataCache.data;
+  }
+
   const spreadsheetId = process.env.MIS_SPREADSHEET_ID || DEFAULT_MIS_SPREADSHEET_ID;
   const sheetName = process.env.MIS_SHEET_NAME || DEFAULT_MIS_SHEET_NAME;
   if (!spreadsheetId) {
@@ -81,5 +100,7 @@ export async function getLatestWeekEndData() {
     .filter((entry) => entry.parsedDate.getTime() === closestTime)
     .map((entry) => entry.row);
 
-  return JSON.stringify(result);
+  const jsonResult = JSON.stringify(result);
+  misDataCache = { data: jsonResult, cachedAt: now };
+  return jsonResult;
 }

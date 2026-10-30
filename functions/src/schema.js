@@ -48,7 +48,7 @@ export const leadsQuerySchema = z.object({
   city: nullableString,
   platform: nullableString,
   search: nullableString,
-  limit: z.coerce.number().optional().default(5000),
+  limit: z.coerce.number().optional(),
 });
 
 export const syncSchema = z.object({

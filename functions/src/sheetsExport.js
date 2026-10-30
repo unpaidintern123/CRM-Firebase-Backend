@@ -589,17 +589,24 @@ function normalizeLeadId(value) {
     .replace(/[^a-z0-9]/g, "");
 }
 
-async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead) {
+async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead, options = {}) {
   const cleanTargetId = normalizeLeadId(lead?.leadUniqueId);
+  const cleanOriginalId = normalizeLeadId(options?.originalLeadUniqueId);
   const targetDigits = String(lead?.mobileNo || "").replace(/\D/g, "");
   const targetMobile10 = targetDigits.slice(-10);
 
   const candidateRows = [];
+  if (typeof options?.targetRow === "number" && options.targetRow > 1) {
+    candidateRows.push(options.targetRow);
+  }
   if (typeof lead?.sheetRowNumber === "number" && lead.sheetRowNumber > 1) {
     candidateRows.push(lead.sheetRowNumber);
   }
   if (cleanTargetId && leadRowCacheMap.has(cleanTargetId)) {
     candidateRows.push(leadRowCacheMap.get(cleanTargetId));
+  }
+  if (cleanOriginalId && leadRowCacheMap.has(cleanOriginalId)) {
+    candidateRows.push(leadRowCacheMap.get(cleanOriginalId));
   }
 
   const matchesPhone = (rowPhone) => {
@@ -620,12 +627,15 @@ async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead) {
       const row = (probe.data.values && probe.data.values[0]) || [];
       const cleanIdVal = normalizeLeadId(row[0]);
       const mobileVal = row[2];
-      if (cleanTargetId && cleanIdVal === cleanTargetId) {
+      if (
+        (cleanTargetId && cleanIdVal === cleanTargetId) ||
+        (cleanOriginalId && cleanIdVal === cleanOriginalId)
+      ) {
         return candidate;
       }
       if (
         matchesPhone(mobileVal) &&
-        (!cleanIdVal || cleanIdVal === cleanTargetId)
+        (!cleanIdVal || cleanIdVal === cleanTargetId || cleanIdVal === cleanOriginalId)
       ) {
         return candidate;
       }
@@ -644,12 +654,15 @@ async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead) {
     const cleanIdVal = normalizeLeadId(idVal);
     const mobileVal = rows[i]?.[2];
 
-    if (cleanTargetId && cleanIdVal === cleanTargetId) {
+    if (
+      (cleanTargetId && cleanIdVal === cleanTargetId) ||
+      (cleanOriginalId && cleanIdVal === cleanOriginalId)
+    ) {
       return i + 1;
     }
     if (
       matchesPhone(mobileVal) &&
-      (!cleanIdVal || cleanIdVal === cleanTargetId)
+      (!cleanIdVal || cleanIdVal === cleanTargetId || cleanIdVal === cleanOriginalId)
     ) {
       return i + 1;
     }
@@ -675,7 +688,7 @@ export async function updateSingleLeadRowInSheets(lead, options = {}) {
   const sheetName = process.env.CRM_LEADS_SHEET_NAME || "Leads Data";
   const cleanTargetId = normalizeLeadId(lead.leadUniqueId);
 
-  const foundRow = await findLeadRowNumber(sheets, spreadsheetId, sheetName, lead);
+  const foundRow = await findLeadRowNumber(sheets, spreadsheetId, sheetName, lead, options);
   const newRowValues = toRow(lead);
 
   if (foundRow && foundRow > 1) {
@@ -686,14 +699,14 @@ export async function updateSingleLeadRowInSheets(lead, options = {}) {
     try {
       const existingResp = await sheets.spreadsheets.values.get({
         spreadsheetId,
-        range: `${sheetName}!A${foundRow}:AQ${foundRow}`,
+        range: `${sheetName}!A${foundRow}:AS${foundRow}`,
       });
       existingValues = (existingResp.data.values && existingResp.data.values[0]) || [];
     } catch (_) {
       existingValues = [];
     }
 
-    const totalCols = Math.max(newRowValues.length, existingValues.length, 43);
+    const totalCols = Math.max(newRowValues.length, existingValues.length, 45);
     const mergedValues = [];
     for (let i = 0; i < totalCols; i++) {
       const newVal = newRowValues[i];
@@ -709,7 +722,7 @@ export async function updateSingleLeadRowInSheets(lead, options = {}) {
 
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: `${sheetName}!A${foundRow}:AQ${foundRow}`,
+      range: `${sheetName}!A${foundRow}:AS${foundRow}`,
       valueInputOption: "USER_ENTERED",
       requestBody: { values: [mergedValues] },
     });
@@ -717,7 +730,7 @@ export async function updateSingleLeadRowInSheets(lead, options = {}) {
   } else if (allowAppend) {
     await sheets.spreadsheets.values.append({
       spreadsheetId,
-      range: `${sheetName}!A:AQ`,
+      range: `${sheetName}!A:AS`,
       valueInputOption: "USER_ENTERED",
       insertDataOption: "INSERT_ROWS",
       requestBody: { values: [newRowValues] },
@@ -858,7 +871,7 @@ export async function updateMultipleLeadRowsInSheets(leads, options = {}) {
 
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `${sheetName}!A:AQ`,
+    range: `${sheetName}!A:AS`,
   });
 
   const allRows = resp.data.values || [];
@@ -894,7 +907,7 @@ export async function updateMultipleLeadRowsInSheets(leads, options = {}) {
     const foundRow = idToRowMap.get(targetId) || idToRowMap.get(cleanTargetId);
 
     const mergedValues = [];
-    const totalCols = Math.max(newRowValues.length, existingValues.length, 43);
+    const totalCols = Math.max(newRowValues.length, existingValues.length, 45);
     for (let i = 0; i < totalCols; i++) {
       const newVal = newRowValues[i];
       const existingVal = existingValues[i];
@@ -909,7 +922,7 @@ export async function updateMultipleLeadRowsInSheets(leads, options = {}) {
 
     if (foundRow) {
       updateData.push({
-        range: `${sheetName}!A${foundRow}:AQ${foundRow}`,
+        range: `${sheetName}!A${foundRow}:AS${foundRow}`,
         values: [mergedValues],
       });
     } else if (allowAppend) {
@@ -935,7 +948,7 @@ export async function updateMultipleLeadRowsInSheets(leads, options = {}) {
   if (appendData.length) {
     await sheets.spreadsheets.values.append({
       spreadsheetId,
-      range: `${sheetName}!A:AQ`,
+      range: `${sheetName}!A:AS`,
       valueInputOption: "USER_ENTERED",
       insertDataOption: "INSERT_ROWS",
       requestBody: { values: appendData },

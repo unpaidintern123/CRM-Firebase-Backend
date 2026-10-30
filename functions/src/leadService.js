@@ -1,3 +1,4 @@
+import admin from "firebase-admin";
 import {
   updateSingleLeadRowInSheets,
   updateLeadLabelInSheets,
@@ -33,25 +34,151 @@ function normalizeDateForCompare(value) {
   return normalizeDateToIso(value) || "";
 }
 
+let allLeadsCache = {
+  docs: null,
+  legacyString: null,
+  cachedAt: 0,
+};
+const ALL_LEADS_CACHE_TTL_MS = 60 * 1000; // 60 seconds
+
+// Per-user cache so reps do not trigger full Firestore scans or invalidate each other's cache
+const userLeadsCache = new Map();
+const USER_LEADS_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
+
+let campaignOptionsCache = {
+  data: null,
+  cachedAt: 0,
+};
+const CAMPAIGN_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+let consultationCache = {
+  data: null,
+  cachedAt: 0,
+};
+const CONSULTATION_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+export function invalidateUserLeadsCache(username) {
+  if (username) {
+    userLeadsCache.delete(String(username).trim());
+  } else {
+    userLeadsCache.clear();
+  }
+}
+
+export function invalidateLeadsCache(options = {}) {
+  allLeadsCache = { docs: null, legacyString: null, cachedAt: 0 };
+  if (options.user) {
+    invalidateUserLeadsCache(options.user);
+  } else {
+    userLeadsCache.clear();
+  }
+  consultationCache = { data: null, cachedAt: 0 };
+  if (options.includeCampaigns) {
+    campaignOptionsCache = { data: null, cachedAt: 0 };
+  }
+}
+
+export function filterLeadsInMemory(leads, filters = {}) {
+  let filtered = [...leads];
+
+  if (filters.assignedTo) {
+    filtered = filtered.filter((l) => l.assignedTo === filters.assignedTo);
+  }
+  if (filters.leadStatus) {
+    filtered = filtered.filter((l) => l.leadStatus === filters.leadStatus);
+  }
+  if (filters.city) {
+    filtered = filtered.filter((l) => l.city === filters.city);
+  }
+  if (filters.platform) {
+    filtered = filtered.filter((l) => l.platform === filters.platform);
+  }
+  if (filters.fromDate) {
+    const fromTs = new Date(filters.fromDate).getTime();
+    if (!Number.isNaN(fromTs)) {
+      filtered = filtered.filter((l) => {
+        const d = new Date(l.leadDate || l.createdAt || 0).getTime();
+        return d >= fromTs;
+      });
+    }
+  }
+  if (filters.toDate) {
+    const toTs = new Date(filters.toDate).getTime();
+    if (!Number.isNaN(toTs)) {
+      filtered = filtered.filter((l) => {
+        const d = new Date(l.leadDate || l.createdAt || 0).getTime();
+        return d <= toTs;
+      });
+    }
+  }
+  if (filters.search) {
+    const needle = filters.search.toLowerCase();
+    filtered = filtered.filter((lead) =>
+      [lead.clientName, lead.mobileNo, lead.city, lead.leadUniqueId]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(needle))
+    );
+  }
+
+  filtered = filtered.filter((lead) => (lead.assignmentStatus || "assigned") !== "pending");
+
+  if (filters.limit && Number(filters.limit) > 0) {
+    filtered = filtered.slice(0, Number(filters.limit));
+  }
+
+  return filtered;
+}
+
 export async function getLeads(filters = {}) {
+  const now = Date.now();
+  const assignedTo = filters.assignedTo ? String(filters.assignedTo).trim() : "";
+
+  // 1. If assignedTo is specified, check per-user cache
+  if (assignedTo) {
+    const userCache = userLeadsCache.get(assignedTo);
+    if (userCache?.docs && now - userCache.cachedAt < USER_LEADS_CACHE_TTL_MS) {
+      return filterLeadsInMemory(userCache.docs, filters);
+    }
+  } else {
+    // Check full cache if warm
+    if (allLeadsCache.docs && now - allLeadsCache.cachedAt < ALL_LEADS_CACHE_TTL_MS) {
+      return filterLeadsInMemory(allLeadsCache.docs, filters);
+    }
+  }
+
   const db = getFirestore();
+  const isUnconstrained =
+    !assignedTo &&
+    !filters.leadStatus &&
+    !filters.city &&
+    !filters.platform &&
+    !filters.search &&
+    !filters.fromDate &&
+    !filters.toDate &&
+    (!filters.limit || Number(filters.limit) >= 5000);
+
   let query = db.collection("leads");
 
-  if (filters.assignedTo) query = query.where("assignedTo", "==", filters.assignedTo);
+  if (assignedTo) query = query.where("assignedTo", "==", assignedTo);
   if (filters.leadStatus) query = query.where("leadStatus", "==", filters.leadStatus);
   if (filters.city) query = query.where("city", "==", filters.city);
   if (filters.platform) query = query.where("platform", "==", filters.platform);
 
-  const requestedLimit = Math.min(filters.limit || 5000, 10000);
-  query = query.limit(requestedLimit);
+  // Safety: if no assignedTo is passed and limit is missing/large, default limit to 200
+  // to prevent accidental 25,000 document reads from blowing the daily free tier
+  if (filters.limit && Number(filters.limit) > 0) {
+    query = query.limit(Number(filters.limit));
+  } else if (!assignedTo) {
+    query = query.limit(200);
+  }
 
   let leads;
   try {
-    // Fast path when composite indexes are available.
+    // Fast path when composite indexes are available
     const orderedSnap = await query.orderBy("updatedAt", "desc").get();
     leads = orderedSnap.docs.map((doc) => ({ ...doc.data(), leadUniqueId: doc.id }));
   } catch (err) {
-    // Fallback path avoids update failures when an index is not created yet.
+    // Fallback path if composite index is still building
     const fallbackSnap = await query.get();
     leads = fallbackSnap.docs.map((doc) => ({ ...doc.data(), leadUniqueId: doc.id }));
     leads.sort((a, b) => {
@@ -61,27 +188,86 @@ export async function getLeads(filters = {}) {
     });
   }
 
-  if (filters.search) {
-    const needle = filters.search.toLowerCase();
-    leads = leads.filter((lead) =>
-      [lead.clientName, lead.mobileNo, lead.city, lead.leadUniqueId]
-        .filter(Boolean)
-        .some((value) => String(value).toLowerCase().includes(needle))
-    );
+  if (assignedTo) {
+    const existing = userLeadsCache.get(assignedTo) || {};
+    userLeadsCache.set(assignedTo, {
+      ...existing,
+      docs: leads,
+      cachedAt: now,
+    });
+  } else if (isUnconstrained) {
+    allLeadsCache.docs = leads;
+    allLeadsCache.cachedAt = now;
+    allLeadsCache.legacyString = null;
   }
 
-  return leads.filter((lead) => (lead.assignmentStatus || "assigned") !== "pending");
+  return filterLeadsInMemory(leads, filters);
 }
 
 export async function getLegacyLeadsPayload(filters = {}) {
+  const now = Date.now();
+  const assignedTo = filters.assignedTo ? String(filters.assignedTo).trim() : "";
+
+  // Check per-user cache for simple user lead requests
+  const isSimpleUserFetch =
+    assignedTo &&
+    !filters.leadStatus &&
+    !filters.city &&
+    !filters.platform &&
+    !filters.search &&
+    !filters.fromDate &&
+    !filters.toDate &&
+    !filters.limit;
+
+  if (isSimpleUserFetch) {
+    const userCache = userLeadsCache.get(assignedTo);
+    if (userCache?.legacyString && now - userCache.cachedAt < USER_LEADS_CACHE_TTL_MS) {
+      return userCache.legacyString;
+    }
+  }
+
+  const isUnconstrained =
+    !assignedTo &&
+    !filters.leadStatus &&
+    !filters.city &&
+    !filters.platform &&
+    !filters.search &&
+    !filters.fromDate &&
+    !filters.toDate &&
+    !filters.limit;
+
+  if (
+    isUnconstrained &&
+    allLeadsCache.legacyString &&
+    now - allLeadsCache.cachedAt < ALL_LEADS_CACHE_TTL_MS
+  ) {
+    return allLeadsCache.legacyString;
+  }
+
   const leads = await getLeads(filters);
-  return JSON.stringify(leads.map(toLegacyLead));
+  const jsonStr = JSON.stringify(leads.map(toLegacyLead));
+
+  if (isSimpleUserFetch) {
+    const existing = userLeadsCache.get(assignedTo) || {};
+    userLeadsCache.set(assignedTo, {
+      ...existing,
+      docs: leads,
+      legacyString: jsonStr,
+      cachedAt: now,
+    });
+  } else if (isUnconstrained) {
+    allLeadsCache.legacyString = jsonStr;
+    allLeadsCache.cachedAt = now;
+  }
+
+  return jsonStr;
 }
 
 export async function updateLead(payload, options = {}) {
   const db = getFirestore();
   const leadRef = db.collection("leads").doc(payload.leadUniqueId);
   const idempotencyKey = payload.idempotencyKey || null;
+  let previousAssignedTo = "";
   // Prefer keys from the raw HTTP body so Zod defaults do not mark every column "changed".
   const rawChangedKeys = Array.isArray(options.changedKeys)
     ? options.changedKeys
@@ -94,6 +280,7 @@ export async function updateLead(payload, options = {}) {
     }
 
     const current = leadSnap.data();
+    previousAssignedTo = current.assignedTo || "";
 
     // Form update or partial patch: only allow fields that were explicitly sent in changedKeys
     // to overwrite existing values. This prevents Zod empty string defaults from wiping untouched fields.
@@ -153,10 +340,8 @@ export async function updateLead(payload, options = {}) {
     const followUpChanged =
       Boolean(followUpDateValue) &&
       normalizeDateForCompare(followUpDateBefore) !== normalizeDateForCompare(followUpDateValue);
-    const followCountSnap = await tx.get(
-      db.collection("followUpLogs").where("leadUniqueId", "==", mergedPayload.leadUniqueId)
-    );
-    const followUpCount = followCountSnap.size + (followUpChanged ? 1 : 0);
+    const previousFollowCount = Number(current.noOfFollowups) || 0;
+    const followUpCount = previousFollowCount + (followUpChanged ? 1 : 0);
 
     const safePayload = { ...mergedPayload };
     // leadDate is treated as immutable in update flow; this prevents accidental
@@ -283,6 +468,30 @@ export async function updateLead(payload, options = {}) {
     void pushLeadToOneinbox(result.updatedLead);
   }
 
+  if (result.updatedLead) {
+    const assignedUser = result.updatedLead.assignedTo;
+    invalidateUserLeadsCache(assignedUser);
+    if (previousAssignedTo && previousAssignedTo !== assignedUser) {
+      invalidateUserLeadsCache(previousAssignedTo);
+    }
+    if (result.newConsultationLog || result.updatedLead?.consutlationBookedDate) {
+      consultationCache = { data: null, cachedAt: 0 };
+    }
+    recordCampaignMetadata(db, result.updatedLead).catch(() => {});
+  }
+
+  if (allLeadsCache.docs && result.updatedLead) {
+    const idx = allLeadsCache.docs.findIndex(
+      (l) => l.leadUniqueId === result.updatedLead.leadUniqueId
+    );
+    if (idx !== -1) {
+      allLeadsCache.docs[idx] = { ...allLeadsCache.docs[idx], ...result.updatedLead };
+    } else {
+      allLeadsCache.docs.unshift(result.updatedLead);
+    }
+    allLeadsCache.legacyString = null;
+  }
+
   return {
     success: true,
     updatedLead: result.updatedLead,
@@ -333,6 +542,18 @@ export async function updateLeadPriority({ leadUniqueId, leadLabel }) {
     console.error("Background lead-label sheet update error:", err);
   });
 
+  if (updatedLead.assignedTo) {
+    invalidateUserLeadsCache(updatedLead.assignedTo);
+  }
+
+  if (allLeadsCache.docs) {
+    const idx = allLeadsCache.docs.findIndex((l) => l.leadUniqueId === id);
+    if (idx !== -1) {
+      allLeadsCache.docs[idx] = { ...allLeadsCache.docs[idx], ...updatedLead };
+    }
+    allLeadsCache.legacyString = null;
+  }
+
   return {
     success: true,
     updatedLead,
@@ -341,32 +562,188 @@ export async function updateLeadPriority({ leadUniqueId, leadLabel }) {
 }
 
 export async function getDashboardMetrics(filters = {}) {
-  const leads = await getLeads({ assignedTo: filters.assignedTo, limit: 5000 });
+  const db = getFirestore();
+  let baseQuery = db.collection("leads");
 
-  const metrics = {
-    total: leads.length,
-    contacted: leads.filter((l) => !["Ringing / Busy", "Not Reachable"].includes(l.leadStatus)).length,
-    booked: leads.filter((l) => l.leadStatus === "Consultation Booked").length,
-    visited: leads.filter((l) => l.leadStatus === "Consultation Visited").length,
-    followup: leads.filter((l) => FOLLOW_UP_STATUSES.has(l.leadStatus)).length,
-    lost: leads.filter((l) => l.leadStatus === "Lost").length,
-    dead: leads.filter((l) => l.leadStatus === "Dead").length,
-    pendingFollowup: leads.filter((l) => FOLLOW_UP_STATUSES.has(l.leadStatus) && l.followUpDate).length,
-  };
+  if (filters.assignedTo) {
+    baseQuery = baseQuery.where("assignedTo", "==", String(filters.assignedTo).trim());
+  }
+  if (filters.city) {
+    baseQuery = baseQuery.where("city", "==", filters.city);
+  }
+  if (filters.platform) {
+    baseQuery = baseQuery.where("platform", "==", filters.platform);
+  }
 
-  return metrics;
+  // Use low-cost Firestore aggregation count() queries (1 read per 1,000 index entries)
+  try {
+    const [
+      totalSnap,
+      newLeadSnap,
+      bookedSnap,
+      visitedSnap,
+      lostSnap,
+      deadSnap,
+    ] = await Promise.all([
+      baseQuery.count().get(),
+      baseQuery.where("leadStatus", "==", "New Lead").count().get(),
+      baseQuery.where("leadStatus", "==", "Consultation Booked").count().get(),
+      baseQuery.where("leadStatus", "==", "Consultation Visited").count().get(),
+      baseQuery.where("leadStatus", "==", "Lost").count().get(),
+      baseQuery.where("leadStatus", "==", "Dead").count().get(),
+    ]);
+
+    const total = totalSnap.data().count;
+    const newLead = newLeadSnap.data().count;
+    const booked = bookedSnap.data().count;
+    const visited = visitedSnap.data().count;
+    const lost = lostSnap.data().count;
+    const dead = deadSnap.data().count;
+
+    let followup = 0;
+    try {
+      const followupSnap = await baseQuery
+        .where("leadStatus", "in", [
+          "Warm Lead",
+          "Cold Lead 1",
+          "Cold Lead 2",
+          "Deferred Lead",
+          "Ringing / Busy",
+          "Not Reachable",
+        ])
+        .count()
+        .get();
+      followup = followupSnap.data().count;
+    } catch (e) {
+      followup = Math.max(0, total - (newLead + booked + visited + lost + dead));
+    }
+
+    return {
+      total,
+      newLead,
+      booked,
+      visited,
+      lost,
+      dead,
+      followup,
+    };
+  } catch (err) {
+    console.warn("Aggregation count failed, computing from user cache:", err?.message);
+    const leads = await getLeads({ assignedTo: filters.assignedTo, limit: 1000 });
+    return {
+      total: leads.length,
+      newLead: leads.filter((l) => l.leadStatus === "New Lead").length,
+      booked: leads.filter((l) => l.leadStatus === "Consultation Booked").length,
+      visited: leads.filter((l) => l.leadStatus === "Consultation Visited").length,
+      lost: leads.filter((l) => l.leadStatus === "Lost").length,
+      dead: leads.filter((l) => l.leadStatus === "Dead").length,
+      followup: leads.filter((l) =>
+        [
+          "Warm Lead",
+          "Cold Lead 1",
+          "Cold Lead 2",
+          "Deferred Lead",
+          "Ringing / Busy",
+          "Not Reachable",
+        ].includes(l.leadStatus)
+      ).length,
+    };
+  }
 }
 
-export async function getCampaignNameOptions() {
-  const leads = await getLeads({ limit: 5000 });
+export async function recordCampaignMetadata(db, leadData = {}) {
+  const updates = {};
+  const { FieldValue } = admin.firestore;
+
+  const campaign = String(leadData.campaignname || "").trim();
+  const ad = String(leadData.adname || "").trim();
+  const adset = String(leadData.adsetname || "").trim();
+  const platform = String(leadData.platform || "").trim();
+  const placement = String(leadData.placement || "").trim();
+
+  if (campaign) updates.campaignNames = FieldValue.arrayUnion(campaign);
+  if (ad) updates.adNames = FieldValue.arrayUnion(ad);
+  if (adset) updates.adSetNames = FieldValue.arrayUnion(adset);
+  if (platform) updates.platforms = FieldValue.arrayUnion(platform);
+  if (placement) updates.placements = FieldValue.arrayUnion(placement);
+
+  if (Object.keys(updates).length > 0) {
+    updates.updatedAt = nowIso();
+    try {
+      await db.collection("config").doc("campaignMetadata").set(updates, { merge: true });
+      campaignOptionsCache = { data: null, cachedAt: 0 };
+    } catch (e) {
+      console.warn("recordCampaignMetadata warning:", e?.message);
+    }
+  }
+}
+
+export async function getCampaignNameOptions(options = {}) {
+  const now = Date.now();
+  if (
+    !options.forceRefresh &&
+    campaignOptionsCache.data &&
+    now - campaignOptionsCache.cachedAt < CAMPAIGN_CACHE_TTL_MS
+  ) {
+    return campaignOptionsCache.data;
+  }
+
+  const db = getFirestore();
+  const metaRef = db.collection("config").doc("campaignMetadata");
+
+  // Fast path: 1 Firestore read from config/campaignMetadata singleton document
+  try {
+    const snap = await metaRef.get();
+    if (snap.exists) {
+      const docData = snap.data() || {};
+      const data = {
+        campaignNames: (docData.campaignNames || []).sort(),
+        adNames: (docData.adNames || []).sort(),
+        adSetNames: (docData.adSetNames || []).sort(),
+        platforms: (docData.platforms || []).sort(),
+        placements: (docData.placements || []).sort(),
+      };
+      campaignOptionsCache = { data, cachedAt: now };
+      return data;
+    }
+  } catch (err) {
+    console.warn("Failed to read config/campaignMetadata, falling back to limited scan:", err?.message);
+  }
+
+  // Fallback if config/campaignMetadata has not been created yet: scan only 100 recent leads (NEVER 3,000!)
+  let snap;
+  try {
+    snap = await db
+      .collection("leads")
+      .select("campaignname", "adname", "adsetname", "platform", "placement")
+      .orderBy("updatedAt", "desc")
+      .limit(100)
+      .get();
+  } catch (err) {
+    snap = await db
+      .collection("leads")
+      .select("campaignname", "adname", "adsetname", "platform", "placement")
+      .limit(100)
+      .get();
+  }
+
+  const leads = snap.docs.map((doc) => doc.data());
   const uniq = (name) => [...new Set(leads.map((l) => l[name]).filter(Boolean))].sort();
-  return {
+  const data = {
     campaignNames: uniq("campaignname"),
     adNames: uniq("adname"),
     adSetNames: uniq("adsetname"),
     platforms: uniq("platform"),
     placements: uniq("placement"),
   };
+
+  // Seed the metadata document so future calls only consume 1 read
+  metaRef.set({ ...data, updatedAt: nowIso() }, { merge: true }).catch((e) => {
+    console.warn("Could not save initial campaignMetadata:", e?.message);
+  });
+
+  campaignOptionsCache = { data, cachedAt: now };
+  return data;
 }
 
 function consultationEntryToLegacyRow(log, lead) {
@@ -406,15 +783,48 @@ function consultationEntryToLegacyRow(log, lead) {
 
 /**
  * Legacy-compatible payload for Consultation Booked Logs dashboards.
- * Prefer consultationLogs joined to leads; fall back to leads with booked dates.
+ * When assignedTo is given, derives directly from user's cached leads to save reads.
  */
-export async function getLegacyConsultationPayload() {
+export async function getLegacyConsultationPayload(options = {}) {
+  const now = Date.now();
+  const assignedTo = options.assignedTo ? String(options.assignedTo).trim() : "";
+
+  // If assignedTo is provided, derive from user's cached leads — saves 100+ reads!
+  if (assignedTo) {
+    let userLeads = userLeadsCache.get(assignedTo)?.docs;
+    if (!userLeads) {
+      userLeads = await getLeads({ assignedTo });
+    }
+    const booked = userLeads
+      .filter((lead) => lead.consutlationBookedDate || lead.leadStatus === "Consultation Booked" || lead.leadStatus === "Consultation Visited")
+      .map((lead) =>
+        consultationEntryToLegacyRow(
+          {
+            createdAt: lead.consutlationBookedDate || lead.leadDate || lead.createdAt,
+            consultationBookedDate: lead.consutlationBookedDate,
+            consultationType: lead.consultationType,
+            leadUniqueId: lead.leadUniqueId,
+          },
+          lead
+        )
+      );
+    return JSON.stringify(booked);
+  }
+
+  if (
+    !options.forceRefresh &&
+    consultationCache.data &&
+    now - consultationCache.cachedAt < CONSULTATION_CACHE_TTL_MS
+  ) {
+    return consultationCache.data;
+  }
+
   const db = getFirestore();
   let logsSnap;
   try {
-    logsSnap = await db.collection("consultationLogs").orderBy("createdAt", "desc").limit(5000).get();
+    logsSnap = await db.collection("consultationLogs").orderBy("createdAt", "desc").limit(200).get();
   } catch (err) {
-    logsSnap = await db.collection("consultationLogs").limit(5000).get();
+    logsSnap = await db.collection("consultationLogs").limit(200).get();
   }
 
   if (!logsSnap.empty) {
@@ -433,10 +843,12 @@ export async function getLegacyConsultationPayload() {
       return consultationEntryToLegacyRow(log, lead);
     });
 
-    return JSON.stringify(rows);
+    const result = JSON.stringify(rows);
+    consultationCache = { data: result, cachedAt: now };
+    return result;
   }
 
-  const leads = await getLeads({ limit: 5000 });
+  const leads = await getLeads({ limit: 100 });
   const rows = leads
     .filter((lead) => lead.consutlationBookedDate)
     .map((lead) =>
@@ -451,7 +863,9 @@ export async function getLegacyConsultationPayload() {
       )
     );
 
-  return JSON.stringify(rows);
+  const result = JSON.stringify(rows);
+  consultationCache = { data: result, cachedAt: now };
+  return result;
 }
 
 export async function createLead(payload) {
@@ -480,15 +894,23 @@ export async function createLead(payload) {
   }
 
   let leadUniqueId = String(normalized.leadUniqueId || payload?.leadUniqueId || "").trim();
-  if (!leadUniqueId) {
+  const originalRequestedId = leadUniqueId;
+  let allocatedNewId = false;
+
+  if (leadUniqueId) {
+    const ref = db.collection("leads").doc(String(leadUniqueId));
+    const snap = await ref.get();
+    if (snap.exists) {
+      // If that ID already exists in DB, replace it with a newly allocated unique ID
+      leadUniqueId = await allocateNextLeadId(db);
+      allocatedNewId = true;
+    }
+  } else {
     leadUniqueId = await allocateNextLeadId(db);
+    allocatedNewId = true;
   }
 
   const ref = db.collection("leads").doc(String(leadUniqueId));
-  const snap = await ref.get();
-  if (snap.exists) {
-    throw new ApiError(409, "LEAD_ALREADY_EXISTS", `Lead ${leadUniqueId} already exists`);
-  }
 
   let assignedTo = String(normalized.assignedTo || payload?.assignedTo || "").trim();
   const assignmentStatus = String(normalized.assignmentStatus || payload?.assignmentStatus || "").trim();
@@ -496,6 +918,8 @@ export async function createLead(payload) {
   const isPendingSyncLead = assignmentStatus === "pending" && syncStatus === "needs_assignment";
   const isExplicitUnassigned = assignedTo.toLowerCase() === "unassigned";
 
+  // If assignedTo is empty (e.g. incoming marketing leads from sendLeadToFirebase),
+  // auto-assign via backend round-robin unless explicitly marked as pending or unassigned.
   if (!assignedTo && !isPendingSyncLead && !isExplicitUnassigned) {
     const roundRobinResult = await assignLeadBackendRoundRobin(db);
     if (roundRobinResult && roundRobinResult.assignedTo) {
@@ -519,9 +943,9 @@ export async function createLead(payload) {
     noOfFollowups: Number(normalized.noOfFollowups) || 0,
     createdAt: now,
     updatedAt: now,
-    assignmentStatus: assignmentStatus || (assignedTo ? "assigned" : "pending"),
-    syncStatus: syncStatus || (assignedTo ? "synced" : "needs_assignment"),
-    assignmentSource: normalized.assignmentSource || "crm_upload",
+    assignmentStatus: assignmentStatus || (assignedTo && assignedTo !== "Unassigned" ? "assigned" : "pending"),
+    syncStatus: syncStatus || (assignedTo && assignedTo !== "Unassigned" ? "synced" : "needs_assignment"),
+    assignmentSource: normalized.assignmentSource || (assignedTo && assignedTo !== "Unassigned" ? "crm_upload" : "sheet_unassigned"),
   };
   await ref.set(doc);
 
@@ -535,7 +959,11 @@ export async function createLead(payload) {
   // Mirror to sheets before returning so Cloud Run cannot drop unfinished writes,
   // and so grid/append failures surface in the upload response path/logs.
   const sheetJobs = [
-    updateSingleLeadRowInSheets(doc, { allowAppend: true }).catch((err) => {
+    updateSingleLeadRowInSheets(doc, {
+      allowAppend: true,
+      originalLeadUniqueId: allocatedNewId && originalRequestedId ? originalRequestedId : null,
+      targetRow: payload?.sheetRowNumber || null,
+    }).catch((err) => {
       console.error("Background new-lead sheet append error:", err);
     }),
   ];
@@ -579,6 +1007,16 @@ export async function createLead(payload) {
   }
 
   await Promise.all(sheetJobs);
+
+  if (doc.assignedTo) {
+    invalidateUserLeadsCache(doc.assignedTo);
+  }
+  recordCampaignMetadata(db, doc).catch(() => {});
+
+  if (allLeadsCache.docs) {
+    allLeadsCache.docs.unshift(doc);
+    allLeadsCache.legacyString = null;
+  }
 
   return { success: true, leadUniqueId, lead: doc };
 }
