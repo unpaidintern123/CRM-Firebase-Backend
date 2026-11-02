@@ -1006,7 +1006,8 @@ export async function createLead(payload) {
     );
   }
 
-  await Promise.all(sheetJobs);
+  // Non-blocking: sheet sync runs in background like updateLead(), never blocks response to frontend
+  Promise.all(sheetJobs).catch((err) => console.error("Background sheetJobs error:", err));
 
   if (doc.assignedTo) {
     invalidateUserLeadsCache(doc.assignedTo);

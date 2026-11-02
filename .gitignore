@@ -1,12 +1,36 @@
+# Node dependencies
 node_modules/
 functions/node_modules/
+
+# Environment and secrets (NEVER commit to GitHub)
 .env
-.env.local
-.DS_Store
-*.log
-*.txt
+.env.*
+*.env
+*.env.local
+functions/.env
+functions/.env.*
+
+# Service account credentials & keys
 *-adminsdk-*.json
+*firebase-adminsdk*.json
 service-account*.json
+*.pem
+*.key
+credentials*.json
+
+# Logs & temp files
+*.log
+firebase-debug.log*
+firestore-debug.log*
+ui-debug.log*
+*.txt
+.DS_Store
 scratch/
 scratch_*.mjs
 
+# Ad-hoc local debug / inspection scripts
+scripts/check-*.mjs
+scripts/delete-*.mjs
+scripts/get-*.mjs
+scripts/search-*.mjs
+scripts/seed-*.mjs
