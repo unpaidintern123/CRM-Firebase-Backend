@@ -296,8 +296,8 @@ async function appendRows(sheets, spreadsheetId, range, rows) {
 async function runLogsExportFullRebuild({ dryRun = false } = {}) {
   const startedAt = new Date().toISOString();
   const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
-  const followUpSheetName = process.env.CRM_FOLLOWUP_LOGS_SHEET_NAME || "Follow-up Logs";
-  const consultationSheetName = process.env.CRM_CONSULTATION_LOGS_SHEET_NAME || "Consultation Booked Logs";
+  const followUpSheetName = process.env.CRM_FOLLOWUP_LOGS_SHEET_NAME || process.env.CRM_FOLLOW_UP_SHEET_NAME || "Follow-up Logs";
+  const consultationSheetName = process.env.CRM_CONSULTATION_LOGS_SHEET_NAME || process.env.CRM_CONSULTATION_SHEET_NAME || "Consultation Booked Logs";
   const db = getFirestore();
 
   const [leadsSnap, followSnap, consultationSnap] = await Promise.all([
@@ -459,8 +459,8 @@ export async function runLogsExportSync({ dryRun = false, fullRebuild = false, b
   }
   const startedAt = new Date().toISOString();
   const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
-  const followUpSheetName = process.env.CRM_FOLLOWUP_LOGS_SHEET_NAME || "Follow-up Logs";
-  const consultationSheetName = process.env.CRM_CONSULTATION_LOGS_SHEET_NAME || "Consultation Booked Logs";
+  const followUpSheetName = process.env.CRM_FOLLOWUP_LOGS_SHEET_NAME || process.env.CRM_FOLLOW_UP_SHEET_NAME || "Follow-up Logs";
+  const consultationSheetName = process.env.CRM_CONSULTATION_LOGS_SHEET_NAME || process.env.CRM_CONSULTATION_SHEET_NAME || "Consultation Booked Logs";
   const db = getFirestore();
 
   const cursorRef = db.collection("config").doc("sheetExportCursors");
@@ -589,24 +589,17 @@ function normalizeLeadId(value) {
     .replace(/[^a-z0-9]/g, "");
 }
 
-async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead, options = {}) {
+async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead) {
   const cleanTargetId = normalizeLeadId(lead?.leadUniqueId);
-  const cleanOriginalId = normalizeLeadId(options?.originalLeadUniqueId);
   const targetDigits = String(lead?.mobileNo || "").replace(/\D/g, "");
   const targetMobile10 = targetDigits.slice(-10);
 
   const candidateRows = [];
-  if (typeof options?.targetRow === "number" && options.targetRow > 1) {
-    candidateRows.push(options.targetRow);
-  }
   if (typeof lead?.sheetRowNumber === "number" && lead.sheetRowNumber > 1) {
     candidateRows.push(lead.sheetRowNumber);
   }
   if (cleanTargetId && leadRowCacheMap.has(cleanTargetId)) {
     candidateRows.push(leadRowCacheMap.get(cleanTargetId));
-  }
-  if (cleanOriginalId && leadRowCacheMap.has(cleanOriginalId)) {
-    candidateRows.push(leadRowCacheMap.get(cleanOriginalId));
   }
 
   const matchesPhone = (rowPhone) => {
@@ -627,15 +620,12 @@ async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead, options
       const row = (probe.data.values && probe.data.values[0]) || [];
       const cleanIdVal = normalizeLeadId(row[0]);
       const mobileVal = row[2];
-      if (
-        (cleanTargetId && cleanIdVal === cleanTargetId) ||
-        (cleanOriginalId && cleanIdVal === cleanOriginalId)
-      ) {
+      if (cleanTargetId && cleanIdVal === cleanTargetId) {
         return candidate;
       }
       if (
         matchesPhone(mobileVal) &&
-        (!cleanIdVal || cleanIdVal === cleanTargetId || cleanIdVal === cleanOriginalId)
+        (!cleanIdVal || cleanIdVal === cleanTargetId)
       ) {
         return candidate;
       }
@@ -654,15 +644,12 @@ async function findLeadRowNumber(sheets, spreadsheetId, sheetName, lead, options
     const cleanIdVal = normalizeLeadId(idVal);
     const mobileVal = rows[i]?.[2];
 
-    if (
-      (cleanTargetId && cleanIdVal === cleanTargetId) ||
-      (cleanOriginalId && cleanIdVal === cleanOriginalId)
-    ) {
+    if (cleanTargetId && cleanIdVal === cleanTargetId) {
       return i + 1;
     }
     if (
       matchesPhone(mobileVal) &&
-      (!cleanIdVal || cleanIdVal === cleanTargetId || cleanIdVal === cleanOriginalId)
+      (!cleanIdVal || cleanIdVal === cleanTargetId)
     ) {
       return i + 1;
     }
@@ -688,7 +675,7 @@ export async function updateSingleLeadRowInSheets(lead, options = {}) {
   const sheetName = process.env.CRM_LEADS_SHEET_NAME || "Leads Data";
   const cleanTargetId = normalizeLeadId(lead.leadUniqueId);
 
-  const foundRow = await findLeadRowNumber(sheets, spreadsheetId, sheetName, lead, options);
+  const foundRow = await findLeadRowNumber(sheets, spreadsheetId, sheetName, lead);
   const newRowValues = toRow(lead);
 
   if (foundRow && foundRow > 1) {
@@ -699,14 +686,14 @@ export async function updateSingleLeadRowInSheets(lead, options = {}) {
     try {
       const existingResp = await sheets.spreadsheets.values.get({
         spreadsheetId,
-        range: `${sheetName}!A${foundRow}:AS${foundRow}`,
+        range: `${sheetName}!A${foundRow}:AQ${foundRow}`,
       });
       existingValues = (existingResp.data.values && existingResp.data.values[0]) || [];
     } catch (_) {
       existingValues = [];
     }
 
-    const totalCols = Math.max(newRowValues.length, existingValues.length, 45);
+    const totalCols = Math.max(newRowValues.length, existingValues.length, 43);
     const mergedValues = [];
     for (let i = 0; i < totalCols; i++) {
       const newVal = newRowValues[i];
@@ -722,7 +709,7 @@ export async function updateSingleLeadRowInSheets(lead, options = {}) {
 
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: `${sheetName}!A${foundRow}:AS${foundRow}`,
+      range: `${sheetName}!A${foundRow}:AQ${foundRow}`,
       valueInputOption: "USER_ENTERED",
       requestBody: { values: [mergedValues] },
     });
@@ -730,7 +717,7 @@ export async function updateSingleLeadRowInSheets(lead, options = {}) {
   } else if (allowAppend) {
     await sheets.spreadsheets.values.append({
       spreadsheetId,
-      range: `${sheetName}!A:AS`,
+      range: `${sheetName}!A:AQ`,
       valueInputOption: "USER_ENTERED",
       insertDataOption: "INSERT_ROWS",
       requestBody: { values: [newRowValues] },
@@ -871,7 +858,7 @@ export async function updateMultipleLeadRowsInSheets(leads, options = {}) {
 
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `${sheetName}!A:AS`,
+    range: `${sheetName}!A:AQ`,
   });
 
   const allRows = resp.data.values || [];
@@ -907,7 +894,7 @@ export async function updateMultipleLeadRowsInSheets(leads, options = {}) {
     const foundRow = idToRowMap.get(targetId) || idToRowMap.get(cleanTargetId);
 
     const mergedValues = [];
-    const totalCols = Math.max(newRowValues.length, existingValues.length, 45);
+    const totalCols = Math.max(newRowValues.length, existingValues.length, 43);
     for (let i = 0; i < totalCols; i++) {
       const newVal = newRowValues[i];
       const existingVal = existingValues[i];
@@ -922,7 +909,7 @@ export async function updateMultipleLeadRowsInSheets(leads, options = {}) {
 
     if (foundRow) {
       updateData.push({
-        range: `${sheetName}!A${foundRow}:AS${foundRow}`,
+        range: `${sheetName}!A${foundRow}:AQ${foundRow}`,
         values: [mergedValues],
       });
     } else if (allowAppend) {
@@ -948,7 +935,7 @@ export async function updateMultipleLeadRowsInSheets(leads, options = {}) {
   if (appendData.length) {
     await sheets.spreadsheets.values.append({
       spreadsheetId,
-      range: `${sheetName}!A:AS`,
+      range: `${sheetName}!A:AQ`,
       valueInputOption: "USER_ENTERED",
       insertDataOption: "INSERT_ROWS",
       requestBody: { values: appendData },
@@ -968,7 +955,7 @@ export async function appendSingleConsultationLogToSheets(lead, log) {
   const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
   if (!spreadsheetId) return { success: false, reason: "NO_SPREADSHEET_ID" };
 
-  const consultationSheetName = process.env.CRM_CONSULTATION_LOGS_SHEET_NAME || "Consultation Booked Logs";
+  const consultationSheetName = process.env.CRM_CONSULTATION_LOGS_SHEET_NAME || process.env.CRM_CONSULTATION_SHEET_NAME || "Consultation Booked Logs";
   const auth = getGoogleAuth();
   const sheets = google.sheets({ version: "v4", auth });
   const row = consultationLogToRow(log, lead);
@@ -982,7 +969,7 @@ export async function appendSingleFollowUpLogToSheets(lead, log) {
   const spreadsheetId = process.env.CRM_SYNC_SHEET_ID || "1fiqGa4nRkSkun-nffI_QVtFQG4o4ubJGXkMIcEprI1k";
   if (!spreadsheetId) return { success: false, reason: "NO_SPREADSHEET_ID" };
 
-  const followUpSheetName = process.env.CRM_FOLLOWUP_LOGS_SHEET_NAME || "Follow-up Logs";
+  const followUpSheetName = process.env.CRM_FOLLOWUP_LOGS_SHEET_NAME || process.env.CRM_FOLLOW_UP_SHEET_NAME || "Follow-up Logs";
   const auth = getGoogleAuth();
   const sheets = google.sheets({ version: "v4", auth });
   const row = followUpLogToRow(log, lead);

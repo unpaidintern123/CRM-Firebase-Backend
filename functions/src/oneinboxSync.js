@@ -16,27 +16,39 @@ export async function pushLeadToOneinbox(lead) {
   const url = String(process.env.ONEINBOX_WEBHOOK_URL || "").trim();
   if (!url || !lead) return;
 
+  const phone = digitsPhone(lead.mobileNo);
+  // oneinbox LSQ webhook prefers mobileNo; keep Phone for compatibility.
   const body = {
     ProspectID: lead.leadUniqueId || "",
     ProspectAutoId: lead.leadUniqueId || "",
-    Phone: digitsPhone(lead.mobileNo),
+    mobileNo: phone,
+    Phone: phone,
+    leadStatus: lead.leadStatus || "",
     ProspectStage: lead.leadStatus || "",
     FirstName: lead.clientName || "",
     OwnerIdName: lead.assignedTo || "",
+    assignedTo: lead.assignedTo || "",
     Source: lead.campaignsource || lead.platform || "CRM",
+    platform: lead.platform || "",
   };
 
+  // 5s was aborting on cold oneinbox ("operation was aborted due to timeout").
+  const timeoutMs = Number(process.env.ONEINBOX_WEBHOOK_TIMEOUT_MS || 20000);
   try {
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) {
       console.warn("[oneinboxSync] HTTP", res.status, await res.text().catch(() => ""));
     }
   } catch (e) {
-    console.warn("[oneinboxSync] push failed:", e?.message || e);
+    console.warn(
+      "[oneinboxSync] push failed:",
+      e?.message || e,
+      `timeoutMs=${timeoutMs}`,
+    );
   }
 }
