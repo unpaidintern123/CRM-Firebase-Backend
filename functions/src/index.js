@@ -34,6 +34,7 @@ import {
 import { checkLogin } from "./authService.js";
 import { toLegacyLead } from "./mapper.js";
 import { getFirestore } from "./firebase.js";
+import bcrypt from "bcryptjs";
 
 import path from "path";
 import { fileURLToPath } from "url";
@@ -242,13 +243,73 @@ export const api = onRequest(
       return sendJson(res, 200, { success: true, data: result });
     }
 
-    if (method === "POST" && path === "/admin/sync-assignees") {
+    if (method === "POST" && (path === "/admin/sync-assignees" || path === "/admin/sync-users")) {
       const body = adminSyncAssigneesSchema.parse(req.body || {});
       const db = getFirestore();
       const configRef = db.collection("config").doc("leadAssignment");
       const now = new Date().toISOString();
       const incoming = [...new Set((body.activeAssignees || []).map((a) => String(a || "").trim()).filter(Boolean))];
       const incomingMonday = [...new Set((body.mondayEligibleAssignees || []).map((a) => String(a || "").trim()).filter(Boolean))];
+
+      const rawUsers = Array.isArray(body.users) && body.users.length ? body.users : (Array.isArray(body.usersSnapshot) ? body.usersSnapshot : []);
+      let createdCount = 0;
+      let updatedCount = 0;
+
+      // 1. Sync full user records in Firestore users collection
+      for (const u of rawUsers) {
+        const username = String(u.username || "").trim();
+        if (!username) continue;
+
+        const uRef = db.collection("users").doc(username);
+        const snap = await uRef.get();
+        const existing = snap.exists ? snap.data() : null;
+
+        let passwordHash = existing?.passwordHash || "";
+        const plainPassword = String(u.password || "").trim();
+        if (plainPassword) {
+          if (!passwordHash) {
+            passwordHash = await bcrypt.hash(plainPassword, 10);
+          } else {
+            const matches = await bcrypt.compare(plainPassword, passwordHash);
+            if (!matches) {
+              passwordHash = await bcrypt.hash(plainPassword, 10);
+            }
+          }
+        }
+
+        const permission = String(u.permission || existing?.permission || "CRM Executive").trim();
+        const status = String(u.status || existing?.status || "Inactive").trim();
+        const nextMonday = u.nextMonday !== undefined ? String(u.nextMonday).trim() : (existing?.nextMonday || "");
+        const leadFlow = u.leadFlow !== undefined ? String(u.leadFlow).trim() : (existing?.leadFlow || "");
+        const email = u.email !== undefined ? String(u.email).trim() : (existing?.email || "");
+
+        const userData = {
+          username,
+          permission,
+          status,
+          nextMonday,
+          leadFlow,
+          email,
+          homeLink: existing?.homeLink || "",
+          updatedAt: now,
+          source: body.source || "users_sheet_sync",
+        };
+        if (passwordHash) {
+          userData.passwordHash = passwordHash;
+        }
+
+        if (!existing) {
+          userData.createdAt = now;
+          await uRef.set(userData);
+          createdCount++;
+        } else {
+          if (!existing.createdAt) userData.createdAt = now;
+          await uRef.set(userData, { merge: true });
+          updatedCount++;
+        }
+      }
+
+      // 2. Update config/leadAssignment in transaction
       const result = await db.runTransaction(async (tx) => {
         const snap = await tx.get(configRef);
         const prev = snap.exists ? snap.data() : {};
@@ -270,7 +331,7 @@ export const api = onRequest(
             mondayEligibleAssignees: incomingMonday,
             source: body.source || "google_sheet_users",
             syncedBy: body.syncedBy || "unknown",
-            usersSnapshot: body.usersSnapshot || [],
+            usersSnapshot: rawUsers.length ? rawUsers : (body.usersSnapshot || []),
             updatedAt: now,
             lastAssignedIndex: nextIndex,
             addedAssignees,
@@ -279,22 +340,24 @@ export const api = onRequest(
           { merge: true }
         );
 
-        (body.allUsersStatus || []).forEach((u) => {
-          if (u.username) {
-            const uRef = db.collection("users").doc(String(u.username).trim());
-            tx.set(uRef, { status: u.status || "Inactive", updatedAt: now }, { merge: true });
-          }
-        });
+        if (!rawUsers.length) {
+          (body.allUsersStatus || []).forEach((u) => {
+            if (u.username) {
+              const uRef = db.collection("users").doc(String(u.username).trim());
+              tx.set(uRef, { status: u.status || "Inactive", updatedAt: now }, { merge: true });
+            }
+          });
 
-        removedAssignees.forEach((name) => {
-          const uRef = db.collection("users").doc(name);
-          tx.set(uRef, { status: "Inactive", updatedAt: now }, { merge: true });
-        });
+          removedAssignees.forEach((name) => {
+            const uRef = db.collection("users").doc(name);
+            tx.set(uRef, { status: "Inactive", updatedAt: now }, { merge: true });
+          });
 
-        incoming.forEach((name) => {
-          const uRef = db.collection("users").doc(name);
-          tx.set(uRef, { status: "Active", updatedAt: now }, { merge: true });
-        });
+          incoming.forEach((name) => {
+            const uRef = db.collection("users").doc(name);
+            tx.set(uRef, { status: "Active", updatedAt: now }, { merge: true });
+          });
+        }
 
         return {
           activeAssignees: incoming,
@@ -303,6 +366,9 @@ export const api = onRequest(
           addedAssignees,
           removedAssignees,
           lastAssignedIndex: nextIndex,
+          totalUsersSynced: rawUsers.length || incoming.length,
+          createdCount,
+          updatedCount,
           updatedAt: now,
         };
       });

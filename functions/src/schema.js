@@ -81,8 +81,9 @@ export const logsExportSyncSchema = z.object({
 export const adminSyncAssigneesSchema = z.object({
   activeAssignees: z.array(z.string()).default([]),
   mondayEligibleAssignees: z.array(z.string()).optional().default([]),
-  allUsersStatus: z.array(z.object({ username: z.string(), status: z.string() })).optional().default([]),
+  allUsersStatus: z.array(z.object({ username: z.string(), status: z.string().optional() })).optional().default([]),
   source: nullableString.optional().default("google_sheet_users"),
   syncedBy: nullableString.optional().default("unknown"),
   usersSnapshot: z.array(z.any()).optional().default([]),
+  users: z.array(z.any()).optional().default([]),
 });

@@ -34,3 +34,4 @@ scripts/delete-*.mjs
 scripts/get-*.mjs
 scripts/search-*.mjs
 scripts/seed-*.mjs
+scripts/cleanup-*.mjs
